@@ -13,5 +13,6 @@ pub struct Config {
     pub allow_peers: Vec<PublicKey>,
     pub show_id: bool,
     pub rescan: bool,
+    pub sync_state_interval_secs: u64,
     pub invite_expire_secs: u64,
 }

@@ -62,6 +62,14 @@ struct Cli {
     rescan: bool,
 
     #[arg(
+        long = "sync-state-interval",
+        value_name = "SECONDS",
+        default_value = "10",
+        help = "Broadcast SyncState every N seconds"
+    )]
+    sync_state_interval_secs: u64,
+
+    #[arg(
         long = "invite",
         help = "Generate an invite ticket and exit (the running daemon will accept it)"
     )]
@@ -115,6 +123,7 @@ fn run_cli() -> io::Result<()> {
         allow_peers: cli.allow_peers,
         show_id: cli.show_id,
         rescan: cli.rescan,
+        sync_state_interval_secs: cli.sync_state_interval_secs,
         invite_expire_secs: cli.expire,
     };
 

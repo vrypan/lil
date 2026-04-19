@@ -32,7 +32,6 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 
 pub(crate) const ALPN: &[u8] = b"tngl/folder/1";
 const DAEMON_CACHE_VERSION: u32 = 8;
-const RESYNC_INTERVAL: Duration = Duration::from_secs(30);
 const MEMBERLIST_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) enum Command {
@@ -66,7 +65,6 @@ struct State {
     local_origin: String,
     topic_id: TopicId,
     peers: Vec<EndpointAddr>,
-    sync_peers: Arc<tokio::sync::Mutex<Vec<EndpointAddr>>>,
     allowlist: Arc<RwLock<HashSet<PublicKey>>>,
     gossip_sender: GossipSender,
     members: HashMap<String, MemberEntry>,
@@ -196,27 +194,6 @@ async fn run_async(config: Config) -> io::Result<()> {
         }
     });
 
-    let sync_peers = Arc::new(tokio::sync::Mutex::new(peers.clone()));
-    let sync_peers_task = Arc::clone(&sync_peers);
-    let sync_tx = cmd_tx.clone();
-    tokio::spawn(async move {
-        {
-            let peers = sync_peers_task.lock().await;
-            for peer in peers.iter() {
-                let _ = sync_tx.send(Command::SyncPeer(peer.clone()));
-            }
-        }
-        let mut interval = tokio::time::interval(RESYNC_INTERVAL);
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let peers = sync_peers_task.lock().await.clone();
-            for peer in &peers {
-                let _ = sync_tx.send(Command::SyncPeer(peer.clone()));
-            }
-        }
-    });
-
     let member_tx = cmd_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(MEMBERLIST_INTERVAL);
@@ -224,6 +201,17 @@ async fn run_async(config: Config) -> io::Result<()> {
         loop {
             interval.tick().await;
             let _ = member_tx.send(Command::PublishMemberList);
+        }
+    });
+
+    let sync_state_tx = cmd_tx.clone();
+    let sync_state_interval = Duration::from_secs(config.sync_state_interval_secs.max(1));
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(sync_state_interval);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let _ = sync_state_tx.send(Command::PublishSyncState);
         }
     });
 
@@ -253,7 +241,6 @@ async fn run_async(config: Config) -> io::Result<()> {
         local_origin,
         topic_id,
         peers,
-        sync_peers,
         allowlist,
         gossip_sender,
         members,
@@ -353,7 +340,6 @@ async fn run_async(config: Config) -> io::Result<()> {
                 let peer_addr = EndpointAddr::new(id);
                 if !state.peers.iter().any(|peer| peer.id == id) {
                     state.peers.push(peer_addr.clone());
-                    state.sync_peers.lock().await.push(peer_addr.clone());
                 }
                 state.allowlist.write().await.insert(id);
                 persist_members(&state.peers_path, state.topic_id, &state.members)?;
@@ -744,7 +730,6 @@ async fn handle_gossip_message(
             state.removed_from_group |= update.removed_from_group;
             let peers = update.peers;
             state.peers = peers.clone();
-            *state.sync_peers.lock().await = peers.clone();
             let allowlist: HashSet<PublicKey> = peers.iter().map(|peer| peer.id).collect();
             *state.allowlist.write().await = allowlist;
             persist_members(&state.peers_path, state.topic_id, &state.members)?;
