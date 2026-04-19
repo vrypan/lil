@@ -98,6 +98,11 @@ async fn run_async(config: Config) -> io::Result<()> {
 
     let sync_dir = canonical_path(config.sync_dir);
     let cache_path = config.cache_path;
+
+    // Acquire an exclusive OS lock on the state directory. Held for the
+    // lifetime of the daemon; released automatically on exit or crash.
+    let _lock = acquire_daemon_lock(&config.key_path.parent().unwrap_or(&sync_dir))?;
+
     print_node_info(&endpoint)?;
 
     let saved_peers_file = load_peers(&config.peers_path)?;
@@ -507,6 +512,30 @@ pub fn run_remove(config: Config, peer_id: PublicKey) -> io::Result<()> {
         tracing::info!(target: "tngl", peer = target_id, "peer removed");
         Ok(())
     })
+}
+
+/// Open `.tngl/daemon.lock` and hold an exclusive non-blocking flock.
+///
+/// Returns the open `File` — the lock is released when it is dropped.
+/// Returns an error immediately if another daemon instance holds the lock.
+fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
+    let lock_path = state_dir.join("daemon.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    let ret = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Err(io::Error::other(
+                "another tngl instance is already running on this folder",
+            ));
+        }
+        return Err(err);
+    }
+    Ok(file)
 }
 
 fn load_or_create_secret_key(path: &Path) -> io::Result<SecretKey> {
