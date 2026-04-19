@@ -1,5 +1,9 @@
 # tngl
 
+> [!WARNING]
+> `tbgl` is experimental. There may be bugs that could delete or expose
+> your files.
+
 `tngl` syncs a folder between a small, trusted group of nodes over `iroh`.
 
 It is designed for direct peer-to-peer sync between your own machines or other
