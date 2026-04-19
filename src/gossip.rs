@@ -93,7 +93,10 @@ mod tests {
         };
         let bytes = msg.to_bytes();
         let parsed = GossipMessage::from_bytes(&bytes).unwrap();
-        assert!(matches!(parsed, GossipMessage::FileChanged { lamport: 42, .. }));
+        assert!(matches!(
+            parsed,
+            GossipMessage::FileChanged { lamport: 42, .. }
+        ));
     }
 
     #[test]
@@ -101,8 +104,16 @@ mod tests {
         let msg = GossipMessage::MemberList {
             origin: "node-x".into(),
             members: vec![
-                MemberEntry { id: "node-a".into(), status: MemberStatus::Active, lamport: 10 },
-                MemberEntry { id: "node-b".into(), status: MemberStatus::Removed, lamport: 15 },
+                MemberEntry {
+                    id: "node-a".into(),
+                    status: MemberStatus::Active,
+                    lamport: 10,
+                },
+                MemberEntry {
+                    id: "node-b".into(),
+                    status: MemberStatus::Removed,
+                    lamport: 15,
+                },
             ],
         };
         let bytes = msg.to_bytes();
@@ -124,6 +135,9 @@ mod tests {
         };
         let bytes = msg.to_bytes();
         let parsed = GossipMessage::from_bytes(&bytes).unwrap();
-        assert!(matches!(parsed, GossipMessage::SyncState { lamport: 99, .. }));
+        assert!(matches!(
+            parsed,
+            GossipMessage::SyncState { lamport: 99, .. }
+        ));
     }
 }

@@ -3,15 +3,21 @@ use crate::config::Config;
 use crate::diagnostics::emit_snapshot;
 use crate::gossip::{GossipMessage, MemberEntry, MemberStatus};
 use crate::invite::{add_invite, generate_token, now_ms};
-use crate::peers::{load_peers, save_group_state};
+use crate::peers::{load_peers, save_group_state, set_topic_id};
 use crate::snapshot::{
-    HashMapById, ReplicatedEntry, SnapshotEntry,
-    apply_remote_entries, canonical_path, collect_file_send_list, process_local_event,
-    reconcile_startup_state, snapshot_from_wire,
+    HashMapById, ReplicatedEntry, SnapshotEntry, apply_remote_entries, canonical_path,
+    collect_file_send_list, process_local_event, reconcile_startup_state, should_accept_remote,
+    snapshot_from_wire,
 };
-use crate::sync_tree::{TreeNodeInfo, get_nodes};
-use crate::transport::{broadcast_entries, handle_incoming, send_join_request, sync_peer};
+use crate::sync_tree::{TreeNodeInfo, get_nodes, root_hash};
+use crate::transport::{FolderProtocol, fetch_entries, send_join_request, sync_peer};
+use futures_lite::StreamExt;
+use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey, Watcher};
+use iroh_gossip::{
+    ALPN as GOSSIP_ALPN, Gossip, TopicId,
+    api::{Event as GossipEvent, GossipSender},
+};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher as _};
 use signal_hook::consts::signal::SIGTERM;
 use signal_hook::flag;
@@ -27,11 +33,11 @@ use tokio::sync::{RwLock, mpsc, oneshot};
 pub(crate) const ALPN: &[u8] = b"tngl/folder/1";
 const DAEMON_CACHE_VERSION: u32 = 8;
 const RESYNC_INTERVAL: Duration = Duration::from_secs(30);
+const MEMBERLIST_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) enum Command {
     LocalFs(Event),
     ApplyRemote {
-        peer: PublicKey,
         entries: Vec<(ReplicatedEntry, Option<PathBuf>)>,
         respond_to: Option<oneshot::Sender<()>>,
     },
@@ -47,15 +53,24 @@ pub(crate) enum Command {
     AddPeer {
         id: PublicKey,
     },
+    GossipReceived(GossipMessage),
+    PublishSyncState,
+    PublishMemberList,
 }
 
 struct State {
-    sync_dir: std::path::PathBuf,
-    cache_path: std::path::PathBuf,
+    sync_dir: PathBuf,
+    cache_path: PathBuf,
+    peers_path: PathBuf,
     endpoint: Endpoint,
     local_origin: String,
+    topic_id: TopicId,
     peers: Vec<EndpointAddr>,
     sync_peers: Arc<tokio::sync::Mutex<Vec<EndpointAddr>>>,
+    allowlist: Arc<RwLock<HashSet<PublicKey>>>,
+    gossip_sender: GossipSender,
+    members: HashMap<String, MemberEntry>,
+    removed_from_group: bool,
     lamport: u64,
     entries: HashMapById,
     suppressed: HashMap<String, SnapshotEntry>,
@@ -72,7 +87,7 @@ pub fn run(config: Config) -> io::Result<()> {
 async fn run_async(config: Config) -> io::Result<()> {
     let secret_key = load_or_create_secret_key(&config.key_path)?;
     let endpoint = Endpoint::builder()
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), GOSSIP_ALPN.to_vec()])
         .secret_key(secret_key.clone())
         .bind()
         .await
@@ -85,24 +100,24 @@ async fn run_async(config: Config) -> io::Result<()> {
 
     let sync_dir = canonical_path(config.sync_dir);
     let cache_path = config.cache_path;
-    let tmp_dir: Arc<Path> = sync_dir.join(".tngl").into();
     print_node_info(&endpoint)?;
 
-    // Load peers from peers.json.
     let saved_peers_file = load_peers(&config.peers_path)?;
-    let mut peers: Vec<EndpointAddr> = Vec::new();
+    let topic_id = ensure_topic_id(&config.peers_path, saved_peers_file.topic_id.as_deref())?;
 
-    // CLI-supplied peers.
-    for p in &config.peers {
-        peers.push(p.clone());
+    let mut peers: Vec<EndpointAddr> = Vec::new();
+    for peer in &config.peers {
+        peers.push(peer.clone());
     }
     for peer_id in &config.peer_ids {
         peers.push(EndpointAddr::new(*peer_id));
     }
-    // Persisted peers from peers.json.
-    for id in saved_peers_file.peer_ids() {
-        peers.push(EndpointAddr::new(id));
+    for peer_id in saved_peers_file.peer_ids() {
+        peers.push(EndpointAddr::new(peer_id));
     }
+    let local_origin = endpoint.id().to_string();
+    peers.retain(|peer| peer.id != endpoint.id());
+    dedupe_peers(&mut peers);
 
     let mut allowlist: HashSet<PublicKey> = config.allow_peers.into_iter().collect();
     for peer_id in &config.peer_ids {
@@ -111,7 +126,7 @@ async fn run_async(config: Config) -> io::Result<()> {
     for peer in &peers {
         allowlist.insert(peer.id);
     }
-    let local_origin = endpoint.id().to_string();
+
     let terminated = Arc::new(AtomicBool::new(false));
     flag::register(SIGTERM, Arc::clone(&terminated)).map_err(io::Error::other)?;
 
@@ -123,13 +138,11 @@ async fn run_async(config: Config) -> io::Result<()> {
         }
     }
 
-    let entries =
-        reconcile_startup_state(&sync_dir, &cache_path, &local_origin, emit_snapshot)?;
+    let entries = reconcile_startup_state(&sync_dir, &cache_path, &local_origin, emit_snapshot)?;
     write_cache_file(&cache_path, &entries, DAEMON_CACHE_VERSION)?;
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
-    // Filesystem watcher.
     let watch_tx = cmd_tx.clone();
     let mut watcher = RecommendedWatcher::new(
         move |result| match result {
@@ -145,43 +158,44 @@ async fn run_async(config: Config) -> io::Result<()> {
         .watch(&sync_dir, RecursiveMode::Recursive)
         .map_err(io::Error::other)?;
 
-    // Incoming connection acceptor.
-    let accept_tx = cmd_tx.clone();
-    let accept_allowlist = Arc::new(RwLock::new(allowlist));
-    let accept_endpoint = endpoint.clone();
-    let accept_invites_path: Arc<Path> = config.invites_path.clone().into();
-    let accept_peers_path: Arc<Path> = config.peers_path.clone().into();
-    let accept_local_id = endpoint.id();
-    let accept_tmp_dir = Arc::clone(&tmp_dir);
+    let allowlist = Arc::new(RwLock::new(allowlist));
+    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let router = Router::builder(endpoint.clone())
+        .accept(
+            ALPN,
+            FolderProtocol {
+                tx: cmd_tx.clone(),
+                allowlist: Arc::clone(&allowlist),
+                invites_path: config.invites_path.clone().into(),
+                peers_path: config.peers_path.clone().into(),
+                local_id: endpoint.id(),
+            },
+        )
+        .accept(GOSSIP_ALPN, gossip.clone())
+        .spawn();
+
+    let bootstrap_peers: Vec<PublicKey> = peers.iter().map(|peer| peer.id).collect();
+    let topic = gossip
+        .subscribe(topic_id, bootstrap_peers)
+        .await
+        .map_err(io::Error::other)?;
+    let (gossip_sender, mut gossip_receiver) = topic.split();
+
+    let gossip_tx = cmd_tx.clone();
     tokio::spawn(async move {
-        loop {
-            let Some(connecting) = accept_endpoint.accept().await else {
-                break;
-            };
-            let accept_tx = accept_tx.clone();
-            let accept_allowlist = Arc::clone(&accept_allowlist);
-            let invites_path = Arc::clone(&accept_invites_path);
-            let peers_path = Arc::clone(&accept_peers_path);
-            let tmp_dir = Arc::clone(&accept_tmp_dir);
-            tokio::spawn(async move {
-                if let Err(err) = handle_incoming(
-                    connecting,
-                    accept_tx,
-                    accept_allowlist,
-                    invites_path,
-                    peers_path,
-                    accept_local_id,
-                    tmp_dir,
-                )
-                .await
-                {
-                    eprintln!("incoming sync error: {err}");
+        while let Some(event) = gossip_receiver.next().await {
+            match event {
+                Ok(GossipEvent::Received(message)) => {
+                    if let Some(parsed) = GossipMessage::from_bytes(&message.content) {
+                        let _ = gossip_tx.send(Command::GossipReceived(parsed));
+                    }
                 }
-            });
+                Ok(_) => {}
+                Err(err) => eprintln!("tngl: gossip receive error: {err}"),
+            }
         }
     });
 
-    // Periodic resync task.
     let sync_peers = Arc::new(tokio::sync::Mutex::new(peers.clone()));
     let sync_peers_task = Arc::clone(&sync_peers);
     let sync_tx = cmd_tx.clone();
@@ -203,13 +217,47 @@ async fn run_async(config: Config) -> io::Result<()> {
         }
     });
 
+    let member_tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(MEMBERLIST_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let _ = member_tx.send(Command::PublishMemberList);
+        }
+    });
+
+    let mut members: HashMap<String, MemberEntry> = saved_peers_file
+        .member_entries()
+        .into_iter()
+        .map(|entry| (entry.id.clone(), entry))
+        .collect();
+    for peer in &peers {
+        members.entry(peer.id.to_string()).or_insert(MemberEntry {
+            id: peer.id.to_string(),
+            status: MemberStatus::Active,
+            lamport: 0,
+        });
+    }
+    members.entry(local_origin.clone()).or_insert(MemberEntry {
+        id: local_origin.clone(),
+        status: MemberStatus::Active,
+        lamport: 0,
+    });
+
     let mut state = State {
         sync_dir,
         cache_path,
+        peers_path: config.peers_path.clone(),
         endpoint,
         local_origin,
+        topic_id,
         peers,
         sync_peers,
+        allowlist,
+        gossip_sender,
+        members,
+        removed_from_group: false,
         lamport: entries
             .values()
             .map(|entry| entry.lamport)
@@ -218,6 +266,9 @@ async fn run_async(config: Config) -> io::Result<()> {
         entries,
         suppressed: HashMap::new(),
     };
+
+    let _ = cmd_tx.send(Command::PublishSyncState);
+    let _ = cmd_tx.send(Command::PublishMemberList);
 
     while !terminated.load(Ordering::Relaxed) {
         let Some(command) = cmd_rx.recv().await else {
@@ -238,23 +289,21 @@ async fn run_async(config: Config) -> io::Result<()> {
                 }
                 for update in &updates {
                     emit_snapshot(&update.id, &snapshot_from_wire(update));
-                    // Publish FileChanged gossip announcement (when gossip is
-                    // integrated, send over the topic here).
-                    let _msg = GossipMessage::FileChanged {
-                        origin: state.local_origin.clone(),
-                        id: update.id.clone(),
-                        hash: update.hash,
-                        lamport: update.lamport,
-                        changed_at_ms: update.changed_at_ms,
-                    };
-                    // TODO(gossip): topic.broadcast(_msg.to_bytes()).await;
+                    publish_gossip(
+                        &state,
+                        GossipMessage::FileChanged {
+                            origin: state.local_origin.clone(),
+                            id: update.id.clone(),
+                            hash: update.hash,
+                            lamport: update.lamport,
+                            changed_at_ms: update.changed_at_ms,
+                        },
+                    )
+                    .await;
                 }
                 write_cache_file(&state.cache_path, &state.entries, DAEMON_CACHE_VERSION)?;
-                broadcast_entries(&state.endpoint, &state.peers, &updates, None, &state.sync_dir)
-                    .await;
             }
             Command::ApplyRemote {
-                peer,
                 entries,
                 respond_to,
             } => {
@@ -269,14 +318,6 @@ async fn run_async(config: Config) -> io::Result<()> {
                 )?;
                 if !updates.is_empty() {
                     write_cache_file(&state.cache_path, &state.entries, DAEMON_CACHE_VERSION)?;
-                    broadcast_entries(
-                        &state.endpoint,
-                        &state.peers,
-                        &updates,
-                        Some(peer),
-                        &state.sync_dir,
-                    )
-                    .await;
                 }
                 if let Some(reply) = respond_to {
                     let _ = reply.send(());
@@ -300,14 +341,28 @@ async fn run_async(config: Config) -> io::Result<()> {
                 let _ = respond_to.send(result);
             }
             Command::AddPeer { id } => {
+                state.lamport = state.lamport.saturating_add(1);
+                state.members.insert(
+                    id.to_string(),
+                    MemberEntry {
+                        id: id.to_string(),
+                        status: MemberStatus::Active,
+                        lamport: state.lamport,
+                    },
+                );
                 let peer_addr = EndpointAddr::new(id);
-                state.peers.push(peer_addr.clone());
-                state.sync_peers.lock().await.push(peer_addr.clone());
+                if !state.peers.iter().any(|peer| peer.id == id) {
+                    state.peers.push(peer_addr.clone());
+                    state.sync_peers.lock().await.push(peer_addr.clone());
+                }
+                state.allowlist.write().await.insert(id);
+                persist_members(&state.peers_path, state.topic_id, &state.members)?;
                 let _ = cmd_tx.send(Command::SyncPeer(peer_addr));
-
-                // Publish updated MemberList gossip (when gossip is integrated).
-                let _msg = build_member_list_msg(&state.local_origin, &state.peers);
-                // TODO(gossip): topic.broadcast(_msg.to_bytes()).await;
+                publish_gossip(
+                    &state,
+                    build_member_list_msg(&state.local_origin, &state.members),
+                )
+                .await;
             }
             Command::SyncPeer(peer) => {
                 let tx = cmd_tx.clone();
@@ -320,27 +375,43 @@ async fn run_async(config: Config) -> io::Result<()> {
                     }
                 });
             }
+            Command::GossipReceived(message) => {
+                handle_gossip_message(&mut state, &cmd_tx, message).await?;
+                if state.removed_from_group {
+                    eprintln!("tngl: local node removed from group, leaving topic");
+                    break;
+                }
+            }
+            Command::PublishSyncState => {
+                publish_gossip(
+                    &state,
+                    GossipMessage::SyncState {
+                        origin: state.local_origin.clone(),
+                        root_hash: root_hash(&state.entries),
+                        lamport: state.lamport,
+                    },
+                )
+                .await;
+            }
+            Command::PublishMemberList => {
+                let message = build_member_list_msg(&state.local_origin, &state.members);
+                publish_gossip(&state, message).await;
+            }
         }
     }
 
     write_cache_file(&state.cache_path, &state.entries, DAEMON_CACHE_VERSION)?;
+    router.shutdown().await.map_err(io::Error::other)?;
+    gossip.shutdown().await.map_err(io::Error::other)?;
     Ok(())
 }
 
-fn build_member_list_msg(local_origin: &str, peers: &[EndpointAddr]) -> GossipMessage {
-    let mut members: Vec<MemberEntry> = peers
-        .iter()
-        .map(|p| MemberEntry {
-            id: p.id.to_string(),
-            status: MemberStatus::Active,
-            lamport: 0,
-        })
-        .collect();
-    members.push(MemberEntry {
-        id: local_origin.to_string(),
-        status: MemberStatus::Active,
-        lamport: 0,
-    });
+fn build_member_list_msg(
+    local_origin: &str,
+    members: &HashMap<String, MemberEntry>,
+) -> GossipMessage {
+    let mut members: Vec<MemberEntry> = members.values().cloned().collect();
+    members.sort_by(|left, right| left.id.cmp(&right.id));
     GossipMessage::MemberList {
         origin: local_origin.to_string(),
         members,
@@ -381,15 +452,87 @@ pub fn run_join(config: Config, ticket: &str) -> io::Result<()> {
             .await
             .map_err(io::Error::other)?;
 
-        let (topic_id, mut members) = send_join_request(&endpoint, host_id, token).await?;
-
-        // The inviter includes itself in the members list it sends back;
-        // ensure self is not included.
-        let self_id = endpoint.id().to_string();
-        members.retain(|m| m != &self_id);
-
+        let (topic_id, members) = send_join_request(&endpoint, host_id, token).await?;
         save_group_state(&config.peers_path, topic_id.as_deref(), &members)?;
         eprintln!("tngl: joined successfully");
+        Ok(())
+    })
+}
+
+pub fn run_remove(config: Config, peer_id: PublicKey) -> io::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(io::Error::other)?;
+    runtime.block_on(async move {
+        let secret_key = load_or_create_secret_key(&config.key_path)?;
+        let endpoint = Endpoint::builder()
+            .alpns(vec![GOSSIP_ALPN.to_vec()])
+            .secret_key(secret_key)
+            .bind()
+            .await
+            .map_err(io::Error::other)?;
+
+        let saved_peers_file = load_peers(&config.peers_path)?;
+        let topic_id = ensure_topic_id(&config.peers_path, saved_peers_file.topic_id.as_deref())?;
+        let local_origin = endpoint.id().to_string();
+        let target_id = peer_id.to_string();
+
+        let mut members: HashMap<String, MemberEntry> = saved_peers_file
+            .member_entries()
+            .into_iter()
+            .map(|entry| (entry.id.clone(), entry))
+            .collect();
+        members.entry(local_origin.clone()).or_insert(MemberEntry {
+            id: local_origin.clone(),
+            status: MemberStatus::Active,
+            lamport: 0,
+        });
+        let next_lamport = members
+            .values()
+            .map(|entry| entry.lamport)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        members
+            .entry(target_id.clone())
+            .and_modify(|entry| {
+                entry.status = MemberStatus::Removed;
+                entry.lamport = next_lamport;
+            })
+            .or_insert(MemberEntry {
+                id: target_id.clone(),
+                status: MemberStatus::Removed,
+                lamport: next_lamport,
+            });
+        persist_members(&config.peers_path, topic_id, &members)?;
+
+        let gossip = Gossip::builder().spawn(endpoint.clone());
+        let router = Router::builder(endpoint.clone())
+            .accept(GOSSIP_ALPN, gossip.clone())
+            .spawn();
+        let bootstrap_peers: Vec<PublicKey> = members
+            .values()
+            .filter(|entry| entry.status == MemberStatus::Active && entry.id != local_origin)
+            .filter_map(|entry| entry.id.parse().ok())
+            .collect();
+        let topic = gossip
+            .subscribe(topic_id, bootstrap_peers)
+            .await
+            .map_err(io::Error::other)?;
+        let (sender, _receiver) = topic.split();
+        sender
+            .broadcast(
+                build_member_list_msg(&local_origin, &members)
+                    .to_bytes()
+                    .into(),
+            )
+            .await
+            .map_err(io::Error::other)?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        router.shutdown().await.map_err(io::Error::other)?;
+        gossip.shutdown().await.map_err(io::Error::other)?;
+        eprintln!("tngl: removed peer {target_id}");
         Ok(())
     })
 }
@@ -415,9 +558,240 @@ fn print_node_info(endpoint: &Endpoint) -> io::Result<()> {
     let addr_json = serde_json::to_string(&addr).map_err(io::Error::other)?;
     eprintln!("tngl node-id {}", endpoint.id());
     eprintln!("tngl peer {addr_json}");
-
-    // Publish SyncState gossip on startup (when gossip is integrated).
-    // TODO(gossip): topic.broadcast(SyncState { origin, root_hash, lamport }.to_bytes()).await;
-
     Ok(())
+}
+
+fn dedupe_peers(peers: &mut Vec<EndpointAddr>) {
+    let mut seen = HashSet::new();
+    peers.retain(|peer| seen.insert(peer.id));
+}
+
+fn ensure_topic_id(path: &Path, topic_id: Option<&str>) -> io::Result<TopicId> {
+    if let Some(existing) = topic_id {
+        return existing
+            .parse()
+            .map_err(|err| io::Error::other(format!("invalid stored topic id: {err}")));
+    }
+    let mut bytes = [0u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let topic_id = TopicId::from_bytes(bytes);
+    set_topic_id(path, &encode_hex(topic_id.as_bytes()))?;
+    Ok(topic_id)
+}
+
+fn encode_hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+async fn publish_gossip(state: &State, message: GossipMessage) {
+    if state.removed_from_group {
+        return;
+    }
+    if let Err(err) = state
+        .gossip_sender
+        .broadcast(message.to_bytes().into())
+        .await
+    {
+        eprintln!("tngl: gossip publish error: {err}");
+    }
+}
+
+fn is_active_member(state: &State, id: &str) -> bool {
+    matches!(
+        state.members.get(id).map(|entry| &entry.status),
+        Some(MemberStatus::Active)
+    )
+}
+
+fn persist_members(
+    peers_path: &Path,
+    topic_id: TopicId,
+    members: &HashMap<String, MemberEntry>,
+) -> io::Result<()> {
+    let mut ledger: Vec<MemberEntry> = members.values().cloned().collect();
+    ledger.sort_by(|left, right| left.id.cmp(&right.id));
+    save_group_state(peers_path, Some(&encode_hex(topic_id.as_bytes())), &ledger)
+}
+
+async fn handle_gossip_message(
+    state: &mut State,
+    cmd_tx: &mpsc::UnboundedSender<Command>,
+    message: GossipMessage,
+) -> io::Result<()> {
+    if message.origin() == state.local_origin {
+        return Ok(());
+    }
+    match message {
+        GossipMessage::FileChanged {
+            origin,
+            id,
+            hash,
+            lamport,
+            changed_at_ms,
+        } => {
+            if !is_active_member(state, &origin) {
+                return Ok(());
+            }
+            let remote = SnapshotEntry {
+                hash,
+                lamport,
+                changed_at_ms,
+                origin: origin.clone(),
+                mtime_ms: 0,
+            };
+            if !should_accept_remote(state.entries.get(&id), &remote) {
+                return Ok(());
+            }
+            let Some(peer_id) = file_changed_fetch_peer(
+                is_active_member(state, &origin),
+                state.entries.get(&id),
+                &origin,
+                &remote,
+            ) else {
+                return Ok(());
+            };
+            let endpoint = state.endpoint.clone();
+            let tx = cmd_tx.clone();
+            let sync_dir = state.sync_dir.clone();
+            tokio::spawn(async move {
+                let tmp_dir = sync_dir.join(".tngl");
+                match fetch_entries(&endpoint, &EndpointAddr::new(peer_id), vec![id], &tmp_dir)
+                    .await
+                {
+                    Ok(entries) => {
+                        let (reply_tx, reply_rx) = oneshot::channel();
+                        let _ = tx.send(Command::ApplyRemote {
+                            entries,
+                            respond_to: Some(reply_tx),
+                        });
+                        let _ = reply_rx.await;
+                    }
+                    Err(err) => {
+                        eprintln!("tngl: gossip fetch error from {peer_id}: {err}");
+                        let _ = tx.send(Command::SyncPeer(EndpointAddr::new(peer_id)));
+                    }
+                }
+            });
+        }
+        GossipMessage::SyncState {
+            origin,
+            root_hash: remote_root,
+            ..
+        } => {
+            if !is_active_member(state, &origin) {
+                return Ok(());
+            }
+            if remote_root != root_hash(&state.entries) {
+                if let Ok(peer_id) = origin.parse() {
+                    let _ = cmd_tx.send(Command::SyncPeer(EndpointAddr::new(peer_id)));
+                }
+            }
+        }
+        GossipMessage::MemberList { origin, members } => {
+            if !is_active_member(state, &origin) {
+                return Ok(());
+            }
+            let mut changed = false;
+            for entry in members {
+                let should_apply = state
+                    .members
+                    .get(&entry.id)
+                    .map(|current| entry.lamport > current.lamport)
+                    .unwrap_or(true);
+                if !should_apply {
+                    continue;
+                }
+                if entry.id == state.local_origin && entry.status == MemberStatus::Removed {
+                    state.removed_from_group = true;
+                }
+                state.members.insert(entry.id.clone(), entry);
+                changed = true;
+            }
+            if !changed {
+                return Ok(());
+            }
+
+            let mut peers: Vec<EndpointAddr> = state
+                .members
+                .values()
+                .filter(|entry| {
+                    entry.id != state.local_origin && entry.status == MemberStatus::Active
+                })
+                .filter_map(|entry| entry.id.parse().ok().map(EndpointAddr::new))
+                .collect();
+            dedupe_peers(&mut peers);
+            state.peers = peers.clone();
+            *state.sync_peers.lock().await = peers.clone();
+            let allowlist: HashSet<PublicKey> = peers.iter().map(|peer| peer.id).collect();
+            *state.allowlist.write().await = allowlist;
+            persist_members(&state.peers_path, state.topic_id, &state.members)?;
+            for peer in peers {
+                let _ = cmd_tx.send(Command::SyncPeer(peer));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn file_changed_fetch_peer(
+    origin_is_active_member: bool,
+    current: Option<&SnapshotEntry>,
+    origin: &str,
+    remote: &SnapshotEntry,
+) -> Option<PublicKey> {
+    if !origin_is_active_member {
+        return None;
+    }
+    if !should_accept_remote(current, remote) {
+        return None;
+    }
+    origin.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::TOMBSTONE_HASH;
+
+    fn snapshot(hash_byte: u8, lamport: u64, origin: &str) -> SnapshotEntry {
+        SnapshotEntry {
+            hash: [hash_byte; 32],
+            lamport,
+            changed_at_ms: lamport,
+            origin: origin.to_string(),
+            mtime_ms: 0,
+        }
+    }
+
+    #[test]
+    fn file_changed_fetch_peer_rejects_non_member() {
+        let peer = "03b16e503664b5f13260af120da62bc793232fad5c425a513bb2f2ce675dbf2e".to_string();
+        assert!(file_changed_fetch_peer(false, None, &peer, &snapshot(1, 1, &peer)).is_none());
+    }
+
+    #[test]
+    fn file_changed_fetch_peer_rejects_stale_update() {
+        let peer = "5371ffdc857cb51e0a9f2a1b0d432c73075893238c2cea971116fa8401c3b097".to_string();
+        let current = snapshot(9, 5, "local");
+        assert!(
+            file_changed_fetch_peer(true, Some(&current), &peer, &snapshot(1, 4, &peer)).is_none()
+        );
+    }
+
+    #[test]
+    fn file_changed_fetch_peer_accepts_newer_member_update() {
+        let peer_key = PublicKey::from_bytes(&[9; 32]).unwrap();
+        let peer = peer_key.to_string();
+        let current = SnapshotEntry {
+            hash: TOMBSTONE_HASH,
+            lamport: 1,
+            changed_at_ms: 1,
+            origin: "local".into(),
+            mtime_ms: 0,
+        };
+        assert_eq!(
+            file_changed_fetch_peer(true, Some(&current), &peer, &snapshot(7, 2, &peer)),
+            Some(peer_key)
+        );
+    }
 }

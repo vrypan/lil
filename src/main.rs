@@ -12,7 +12,7 @@ mod transport;
 
 use clap::Parser;
 use config::Config;
-use daemon::{run, run_invite, run_join};
+use daemon::{run, run_invite, run_join, run_remove};
 use iroh::{EndpointAddr, PublicKey};
 use std::io;
 use std::path::PathBuf;
@@ -81,6 +81,13 @@ struct Cli {
         help = "Join a peer using an invite ticket (<node_id>:<token>), then exit"
     )]
     join: Option<String>,
+
+    #[arg(
+        long = "remove-peer",
+        value_name = "NODE_ID",
+        help = "Mark a peer as removed, broadcast the updated member list, then exit"
+    )]
+    remove_peer: Option<PublicKey>,
 }
 
 fn main() {
@@ -113,6 +120,10 @@ fn run_cli() -> io::Result<()> {
 
     if cli.invite {
         return run_invite(config);
+    }
+
+    if let Some(peer_id) = cli.remove_peer {
+        return run_remove(config, peer_id);
     }
 
     if let Some(ticket) = cli.join {

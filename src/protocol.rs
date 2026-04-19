@@ -1,3 +1,4 @@
+use crate::gossip::MemberEntry;
 use crate::snapshot::{Blake3Hash, ReplicatedEntry};
 use crate::sync_tree::TreeNodeInfo;
 use serde::{Deserialize, Serialize};
@@ -16,21 +17,9 @@ pub enum RequestMessage {
     /// Fetch full file entries for the given paths.
     /// Response is `FilesBegin { count }` followed by `count` FileHeader frames,
     /// each optionally followed by `header.size` raw content bytes.
-    GetFiles {
-        request_id: u64,
-        ids: Vec<String>,
-    },
-    /// Live push: `count` FileHeader frames + content bytes follow this frame
-    /// before the send stream is closed. Response is `Ack`.
-    PushEntries {
-        request_id: u64,
-        count: usize,
-    },
+    GetFiles { request_id: u64, ids: Vec<String> },
     /// Join request: joiner presents a one-time token to an existing member.
-    JoinRequest {
-        token: String,
-        joiner_id: String,
-    },
+    JoinRequest { token: String, joiner_id: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,9 +34,6 @@ pub enum ResponseMessage {
         request_id: u64,
         count: usize,
     },
-    Ack {
-        request_id: u64,
-    },
     Error {
         request_id: u64,
         message: String,
@@ -56,7 +42,7 @@ pub enum ResponseMessage {
     /// member list so the new node can subscribe and sync immediately.
     JoinAccepted {
         topic_id: Option<String>,
-        members: Vec<String>,
+        members: Vec<MemberEntry>,
     },
     JoinRejected {
         reason: String,
@@ -65,7 +51,7 @@ pub enum ResponseMessage {
 
 /// Per-file metadata frame sent before the raw content bytes.
 ///
-/// Sent by both the GetFiles responder and the PushEntries initiator.
+/// Sent by the GetFiles responder.
 /// `size == 0` means this is a tombstone; no content bytes follow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileHeader {

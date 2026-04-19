@@ -480,7 +480,7 @@ pub fn rescan_local_state(
     Ok(updates)
 }
 
-/// Build the list of files to send for a `GetFiles` or `PushEntries` response.
+/// Build the list of files to send for a `GetFiles` response.
 ///
 /// Returns `(ReplicatedEntry, Option<PathBuf>)` pairs: `None` path for tombstones,
 /// `Some(path)` pointing to the actual file on disk for live entries.
@@ -716,10 +716,14 @@ fn prune_empty_parent_dirs(sync_dir: &Path, path: &Path) -> io::Result<()> {
         }
         match fs::remove_dir(&dir) {
             Ok(()) => {
-                current = dir.parent().map(|parent| canonical_path(parent.to_path_buf()));
+                current = dir
+                    .parent()
+                    .map(|parent| canonical_path(parent.to_path_buf()));
             }
             Err(err) if matches!(err.kind(), io::ErrorKind::NotFound) => {
-                current = dir.parent().map(|parent| canonical_path(parent.to_path_buf()));
+                current = dir
+                    .parent()
+                    .map(|parent| canonical_path(parent.to_path_buf()));
             }
             Err(err) if matches!(err.kind(), io::ErrorKind::DirectoryNotEmpty) => break,
             Err(err) => return Err(err),
@@ -768,7 +772,9 @@ fn should_ignore_component(name: &OsStr) -> bool {
 }
 
 fn is_ignored_file_name(name: &OsStr) -> bool {
-    IGNORED_FILE_NAMES.iter().any(|candidate| name == OsStr::new(candidate))
+    IGNORED_FILE_NAMES
+        .iter()
+        .any(|candidate| name == OsStr::new(candidate))
         || IGNORED_FILE_PREFIXES
             .iter()
             .any(|prefix| name.to_str().is_some_and(|value| value.starts_with(prefix)))
@@ -1081,17 +1087,9 @@ mod tests {
     fn build_snapshot_map_excludes_os_metadata_directories() {
         let dir = temp_sync_dir();
         fs::create_dir_all(dir.path().join(".Spotlight-V100")).unwrap();
-        fs::write(
-            dir.path().join(".Spotlight-V100/store.db"),
-            b"metadata",
-        )
-        .unwrap();
+        fs::write(dir.path().join(".Spotlight-V100/store.db"), b"metadata").unwrap();
         fs::create_dir_all(dir.path().join("$RECYCLE.BIN")).unwrap();
-        fs::write(
-            dir.path().join("$RECYCLE.BIN/entry.txt"),
-            b"metadata",
-        )
-        .unwrap();
+        fs::write(dir.path().join("$RECYCLE.BIN/entry.txt"), b"metadata").unwrap();
         fs::write(dir.path().join("file1.txt"), b"content").unwrap();
         let entries = build_snapshot_map(dir.path(), "peer-a", None).unwrap();
         assert!(!entries.keys().any(|id| id.starts_with(".Spotlight-V100/")));
@@ -1134,21 +1132,23 @@ mod tests {
         let removed = "gone.txt".to_string();
         write_cache_file(
             &cache_path,
-            &HashMap::from([(removed.clone(), dummy_entry(*blake3::hash(b"old\n").as_bytes(), 7))]),
+            &HashMap::from([(
+                removed.clone(),
+                dummy_entry(*blake3::hash(b"old\n").as_bytes(), 7),
+            )]),
             8,
         )
         .unwrap();
         let mut lines = Vec::new();
-        let entries =
-            reconcile_startup_state(dir.path(), &cache_path, "peer-a", |id, entry| {
-                lines.push(format!(
-                    "{} {} {}",
-                    entry.changed_at_ms,
-                    id,
-                    hex_hash(entry.hash)
-                ));
-            })
-            .unwrap();
+        let entries = reconcile_startup_state(dir.path(), &cache_path, "peer-a", |id, entry| {
+            lines.push(format!(
+                "{} {} {}",
+                entry.changed_at_ms,
+                id,
+                hex_hash(entry.hash)
+            ));
+        })
+        .unwrap();
         let entry = entries.get(&removed).unwrap();
         assert_eq!(entry.hash, TOMBSTONE_HASH);
         assert!(entry.changed_at_ms > 0);
@@ -1166,12 +1166,16 @@ mod tests {
         let ignored = "ignored.txt".to_string();
         write_cache_file(
             &cache_path,
-            &HashMap::from([(ignored.clone(), dummy_entry(*blake3::hash(b"old\n").as_bytes(), 7))]),
+            &HashMap::from([(
+                ignored.clone(),
+                dummy_entry(*blake3::hash(b"old\n").as_bytes(), 7),
+            )]),
             8,
         )
         .unwrap();
 
-        let entries = reconcile_startup_state(dir.path(), &cache_path, "peer-a", |_, _| {}).unwrap();
+        let entries =
+            reconcile_startup_state(dir.path(), &cache_path, "peer-a", |_, _| {}).unwrap();
         let entry = entries.get(&ignored).unwrap();
         assert_eq!(entry.hash, TOMBSTONE_HASH);
         assert_eq!(entry.origin, "peer-a");
@@ -1245,7 +1249,11 @@ mod tests {
         let id = "keep.txt".to_string();
         fs::write(dir.path().join(&id), b"keep\n").unwrap();
         let mut entries = build_snapshot_map(dir.path(), "peer-a", None).unwrap();
-        let mut lamport = entries.values().map(|entry| entry.lamport).max().unwrap_or(0);
+        let mut lamport = entries
+            .values()
+            .map(|entry| entry.lamport)
+            .max()
+            .unwrap_or(0);
         let mut suppressed = HashMap::new();
 
         fs::write(dir.path().join(".notngl"), "keep.txt\n").unwrap();
@@ -1265,9 +1273,11 @@ mod tests {
         .unwrap();
 
         assert!(updates.iter().any(|entry| entry.id == ".notngl"));
-        assert!(updates
-            .iter()
-            .any(|entry| entry.id == "keep.txt" && entry.hash == TOMBSTONE_HASH));
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.id == "keep.txt" && entry.hash == TOMBSTONE_HASH)
+        );
     }
 
     #[test]
@@ -1450,7 +1460,11 @@ mod tests {
         fs::write(dir.path().join("files/dir1/file2.txt"), b"b").unwrap();
 
         let mut entries = build_snapshot_map(dir.path(), "peer-a", None).unwrap();
-        let mut lamport = entries.values().map(|entry| entry.lamport).max().unwrap_or(0);
+        let mut lamport = entries
+            .values()
+            .map(|entry| entry.lamport)
+            .max()
+            .unwrap_or(0);
         let mut suppressed = HashMap::new();
 
         fs::remove_dir_all(dir.path().join("files/dir1")).unwrap();
@@ -1472,8 +1486,16 @@ mod tests {
 
         assert_eq!(updates.len(), 2);
         assert!(updates.iter().all(|entry| entry.hash == TOMBSTONE_HASH));
-        assert!(updates.iter().any(|entry| entry.id == "files/dir1/file1.txt"));
-        assert!(updates.iter().any(|entry| entry.id == "files/dir1/file2.txt"));
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.id == "files/dir1/file1.txt")
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.id == "files/dir1/file2.txt")
+        );
         assert!(!entries.contains_key("files/dir1"));
     }
 

@@ -140,14 +140,6 @@ Used both for targeted fetches after a `FileChanged` announcement and as the
 final step of a repair walk. `ReplicatedEntry` is metadata-only; file content
 is streamed separately on the QUIC stream.
 
-### `PushEntries`
-
-Live push of changed entries directly to peers. The request frame carries only
-the number of entries; each entry is then sent as a `FileHeader` plus optional
-raw content bytes, using the same streaming format as `GetFiles`. Used
-alongside gossip announcements for immediate delivery without waiting for a
-pull.
-
 ## Change Paths
 
 ### Live change
@@ -156,7 +148,6 @@ pull.
 2. Update local state and sync tree
 3. Publish `FileChanged` to gossip topic
 4. Receiving peers: `should_accept_remote` check, then `GetFiles([id])` from origin
-5. Also: direct `PushEntries` to each peer for immediate delivery
 
 ### Repair (startup / reconnect)
 
@@ -375,7 +366,6 @@ transport-level deduplication.
 |---|---|---|
 | `GetNodes` | `path_prefix: String` | `[{name, hash, is_dir}]` |
 | `GetFiles` | `ids: Vec<String>` | `FilesBegin { count }`, then `count` streamed `FileHeader` + content payloads |
-| `PushEntries` | `count: usize`, then `count` streamed `FileHeader` + content payloads | `Ack` |
 
 ### Key decisions
 

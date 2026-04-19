@@ -212,9 +212,7 @@ mod tests {
         assert_ne!(foo1, foo2);
 
         // README.md leaf hash unchanged.
-        let readme_hash = |entries: &HashMapById| {
-            leaf_hash(entries.get("README.md").unwrap())
-        };
+        let readme_hash = |entries: &HashMapById| leaf_hash(entries.get("README.md").unwrap());
         assert_eq!(readme_hash(&entries1), readme_hash(&entries2));
     }
 }

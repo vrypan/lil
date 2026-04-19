@@ -3,8 +3,7 @@ use crate::snapshot::SnapshotEntry;
 use std::io;
 
 pub(crate) fn sync_debug_enabled() -> bool {
-    std::env::var_os("TNGL_DEBUG_SYNC").is_some()
-        || std::env::var_os("STASHD_DEBUG_SYNC").is_some()
+    std::env::var_os("TNGL_DEBUG_SYNC").is_some() || std::env::var_os("STASHD_DEBUG_SYNC").is_some()
 }
 
 pub(crate) fn sync_trace(message: impl AsRef<str>) {
@@ -56,10 +55,6 @@ fn summarize_request(request: &RequestMessage) -> String {
         RequestMessage::GetFiles { request_id, ids } => {
             format!("GetFiles request_id={request_id} ids={}", ids.len())
         }
-        RequestMessage::PushEntries {
-            request_id,
-            count,
-        } => format!("PushEntries request_id={request_id} count={count}"),
         RequestMessage::JoinRequest { joiner_id, .. } => {
             format!("JoinRequest joiner_id={joiner_id}")
         }
@@ -74,7 +69,6 @@ fn summarize_response(response: &ResponseMessage) -> String {
         ResponseMessage::FilesBegin { request_id, count } => {
             format!("FilesBegin request_id={request_id} count={count}")
         }
-        ResponseMessage::Ack { request_id } => format!("Ack request_id={request_id}"),
         ResponseMessage::Error {
             request_id,
             message,
