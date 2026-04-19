@@ -613,6 +613,52 @@ fn persist_members(
     save_group_state(peers_path, Some(&encode_hex(topic_id.as_bytes())), &ledger)
 }
 
+struct MemberListUpdate {
+    changed: bool,
+    removed_from_group: bool,
+    peers: Vec<EndpointAddr>,
+}
+
+fn apply_member_list_update(
+    local_origin: &str,
+    members: &mut HashMap<String, MemberEntry>,
+    incoming: Vec<MemberEntry>,
+) -> MemberListUpdate {
+    let mut changed = false;
+    let mut removed_from_group = false;
+    for entry in incoming {
+        let should_apply = members
+            .get(&entry.id)
+            .map(|current| entry.lamport > current.lamport)
+            .unwrap_or(true);
+        if !should_apply {
+            continue;
+        }
+        if entry.id == local_origin && entry.status == MemberStatus::Removed {
+            removed_from_group = true;
+        }
+        members.insert(entry.id.clone(), entry);
+        changed = true;
+    }
+
+    let mut peers: Vec<EndpointAddr> = if changed {
+        members
+            .values()
+            .filter(|entry| entry.id != local_origin && entry.status == MemberStatus::Active)
+            .filter_map(|entry| entry.id.parse().ok().map(EndpointAddr::new))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    dedupe_peers(&mut peers);
+
+    MemberListUpdate {
+        changed,
+        removed_from_group,
+        peers,
+    }
+}
+
 async fn handle_gossip_message(
     state: &mut State,
     cmd_tx: &mpsc::UnboundedSender<Command>,
@@ -691,35 +737,12 @@ async fn handle_gossip_message(
             if !is_active_member(state, &origin) {
                 return Ok(());
             }
-            let mut changed = false;
-            for entry in members {
-                let should_apply = state
-                    .members
-                    .get(&entry.id)
-                    .map(|current| entry.lamport > current.lamport)
-                    .unwrap_or(true);
-                if !should_apply {
-                    continue;
-                }
-                if entry.id == state.local_origin && entry.status == MemberStatus::Removed {
-                    state.removed_from_group = true;
-                }
-                state.members.insert(entry.id.clone(), entry);
-                changed = true;
-            }
-            if !changed {
+            let update = apply_member_list_update(&state.local_origin, &mut state.members, members);
+            if !update.changed {
                 return Ok(());
             }
-
-            let mut peers: Vec<EndpointAddr> = state
-                .members
-                .values()
-                .filter(|entry| {
-                    entry.id != state.local_origin && entry.status == MemberStatus::Active
-                })
-                .filter_map(|entry| entry.id.parse().ok().map(EndpointAddr::new))
-                .collect();
-            dedupe_peers(&mut peers);
+            state.removed_from_group |= update.removed_from_group;
+            let peers = update.peers;
             state.peers = peers.clone();
             *state.sync_peers.lock().await = peers.clone();
             let allowlist: HashSet<PublicKey> = peers.iter().map(|peer| peer.id).collect();
@@ -752,6 +775,7 @@ fn file_changed_fetch_peer(
 mod tests {
     use super::*;
     use crate::snapshot::TOMBSTONE_HASH;
+    use std::collections::HashMap;
 
     fn snapshot(hash_byte: u8, lamport: u64, origin: &str) -> SnapshotEntry {
         SnapshotEntry {
@@ -793,5 +817,96 @@ mod tests {
             file_changed_fetch_peer(true, Some(&current), &peer, &snapshot(7, 2, &peer)),
             Some(peer_key)
         );
+    }
+
+    fn member(id: &str, status: MemberStatus, lamport: u64) -> MemberEntry {
+        MemberEntry {
+            id: id.to_string(),
+            status,
+            lamport,
+        }
+    }
+
+    #[test]
+    fn member_list_merge_ignores_stale_entries() {
+        let peer_a = "03b16e503664b5f13260af120da62bc793232fad5c425a513bb2f2ce675dbf2e".to_string();
+        let peer_b = "5371ffdc857cb51e0a9f2a1b0d432c73075893238c2cea971116fa8401c3b097".to_string();
+        let local = "local-node";
+        let mut members = HashMap::from([
+            (local.to_string(), member(local, MemberStatus::Active, 1)),
+            (peer_a.clone(), member(&peer_a, MemberStatus::Active, 5)),
+            (peer_b.clone(), member(&peer_b, MemberStatus::Active, 3)),
+        ]);
+
+        let update = apply_member_list_update(
+            local,
+            &mut members,
+            vec![
+                member(&peer_a, MemberStatus::Removed, 4),
+                member(&peer_b, MemberStatus::Removed, 3),
+            ],
+        );
+
+        assert!(!update.changed);
+        assert!(!update.removed_from_group);
+        assert!(update.peers.is_empty());
+        assert_eq!(members.get(&peer_a).unwrap().status, MemberStatus::Active);
+        assert_eq!(members.get(&peer_b).unwrap().status, MemberStatus::Active);
+    }
+
+    #[test]
+    fn member_list_merge_marks_self_removed() {
+        let local = "local-node";
+        let peer = "03b16e503664b5f13260af120da62bc793232fad5c425a513bb2f2ce675dbf2e".to_string();
+        let mut members = HashMap::from([
+            (local.to_string(), member(local, MemberStatus::Active, 1)),
+            (peer.clone(), member(&peer, MemberStatus::Active, 1)),
+        ]);
+
+        let update = apply_member_list_update(
+            local,
+            &mut members,
+            vec![member(local, MemberStatus::Removed, 2)],
+        );
+
+        assert!(update.changed);
+        assert!(update.removed_from_group);
+        assert_eq!(members.get(local).unwrap().status, MemberStatus::Removed);
+        assert_eq!(update.peers.len(), 1);
+        assert_eq!(update.peers[0].id.to_string(), peer);
+    }
+
+    #[test]
+    fn member_list_merge_routes_only_active_non_self_peers() {
+        let local = "local-node";
+        let peer_a = "03b16e503664b5f13260af120da62bc793232fad5c425a513bb2f2ce675dbf2e".to_string();
+        let peer_b = "5371ffdc857cb51e0a9f2a1b0d432c73075893238c2cea971116fa8401c3b097".to_string();
+        let peer_c = PublicKey::from_bytes(&[9; 32]).unwrap().to_string();
+        let mut members = HashMap::from([
+            (local.to_string(), member(local, MemberStatus::Active, 1)),
+            (peer_a.clone(), member(&peer_a, MemberStatus::Active, 1)),
+            (peer_b.clone(), member(&peer_b, MemberStatus::Removed, 1)),
+        ]);
+
+        let update = apply_member_list_update(
+            local,
+            &mut members,
+            vec![
+                member(&peer_b, MemberStatus::Active, 2),
+                member(&peer_c, MemberStatus::Active, 3),
+            ],
+        );
+
+        let mut routed: Vec<String> = update
+            .peers
+            .iter()
+            .map(|peer| peer.id.to_string())
+            .collect();
+        routed.sort();
+        let mut expected = vec![peer_a, peer_b, peer_c];
+        expected.sort();
+        assert!(update.changed);
+        assert!(!update.removed_from_group);
+        assert_eq!(routed, expected);
     }
 }
