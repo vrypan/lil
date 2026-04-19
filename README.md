@@ -189,8 +189,24 @@ tombstones and newly unignored paths can reappear.
 
 ## Debugging
 
-Enable sync trace logging with:
+Log verbosity is controlled via the `RUST_LOG` environment variable.
+The default level is `info`.
+
+Show all operational events (default):
 
 ```bash
-TNGL_DEBUG_SYNC=1 ./target/release/tngl --folder /tmp/node-a
+RUST_LOG=info ./target/release/tngl --folder /tmp/node-a
+```
+
+Show gossip and RPC traffic:
+
+```bash
+RUST_LOG=debug ./target/release/tngl --folder /tmp/node-a
+```
+
+Show only gossip or only RPC at debug level, everything else at info:
+
+```bash
+RUST_LOG=info,tngl::gossip=debug ./target/release/tngl --folder /tmp/node-a
+RUST_LOG=info,tngl::rpc=debug   ./target/release/tngl --folder /tmp/node-a
 ```

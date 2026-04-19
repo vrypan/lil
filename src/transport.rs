@@ -1,5 +1,5 @@
 use crate::daemon::Command;
-use crate::diagnostics::{sync_io_error, sync_trace, sync_trace_request, sync_trace_response};
+use crate::diagnostics::{summarize_request, summarize_response, sync_io_error};
 use crate::gossip::{MemberEntry, MemberStatus};
 use crate::invite::consume_invite;
 use crate::peers::add_peer;
@@ -163,14 +163,14 @@ pub(crate) async fn handle_connection(
     local_id: PublicKey,
 ) -> io::Result<()> {
     let peer = connection.remote_id();
-    sync_trace(format!("incoming connection from {peer}"));
+    tracing::debug!(target: "tngl::rpc", %peer, "incoming connection");
 
     loop {
         let (mut send, mut recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
             Err(err) => {
                 if is_routine_connection_close(&err) {
-                    sync_trace(format!("incoming connection from {peer} closed: {err}"));
+                    tracing::debug!(target: "tngl::rpc", %peer, "connection closed: {err}");
                     return Ok(());
                 }
                 return Err(sync_io_error(
@@ -182,11 +182,11 @@ pub(crate) async fn handle_connection(
         let request: RequestMessage = read_frame(&mut recv)
             .await
             .map_err(|err| sync_io_error(format!("incoming peer {peer}: read request"), err))?;
-        sync_trace_request("recv", peer, &request);
+        tracing::debug!(target: "tngl::rpc", %peer, "recv {}", summarize_request(&request));
 
         // Join requests are handled before the allowlist check — the token is the gate.
         if let RequestMessage::JoinRequest { token, joiner_id } = request {
-            sync_trace(format!("incoming join request from {peer}"));
+            tracing::debug!(target: "tngl::rpc", %peer, "incoming join request");
             let accepted = consume_invite(&invites_path, &token)?;
             if accepted {
                 let joiner_key: PublicKey = joiner_id
@@ -210,7 +210,7 @@ pub(crate) async fn handle_connection(
                     topic_id: pf.topic_id.clone(),
                     members,
                 };
-                sync_trace_response("send", peer, &response);
+                tracing::debug!(target: "tngl::rpc", %peer, "send {}", summarize_response(&response));
                 write_frame(&mut send, &response).await.map_err(|err| {
                     sync_io_error(format!("incoming peer {peer}: write join accepted"), err)
                 })?;
@@ -220,12 +220,12 @@ pub(crate) async fn handle_connection(
                         err,
                     )
                 })?;
-                eprintln!("tngl: joined by {joiner_id}");
+                tracing::info!(target: "tngl", joiner = joiner_id, "peer joined");
             } else {
                 let response = ResponseMessage::JoinRejected {
                     reason: "invalid or expired token".into(),
                 };
-                sync_trace_response("send", peer, &response);
+                tracing::debug!(target: "tngl::rpc", %peer, "send {}", summarize_response(&response));
                 write_frame(&mut send, &response).await.map_err(|err| {
                     sync_io_error(format!("incoming peer {peer}: write join rejected"), err)
                 })?;
@@ -235,16 +235,14 @@ pub(crate) async fn handle_connection(
                         err,
                     )
                 })?;
-                sync_trace(format!(
-                    "join request from {peer}: invalid or expired token"
-                ));
+                tracing::warn!(target: "tngl", %peer, "join request rejected: invalid or expired token");
             }
             continue;
         }
 
         // All other requests require the peer to be allowlisted.
         if !allowlist.read().await.contains(&peer) {
-            sync_trace(format!("rejecting non-allowlisted peer {peer}"));
+            tracing::warn!(target: "tngl", %peer, "rejecting request from non-member peer");
             continue;
         }
 
@@ -261,7 +259,7 @@ pub(crate) async fn handle_connection(
                 })?;
                 let nodes = get_local_nodes(&path_prefix, &tx).await?;
                 let response = ResponseMessage::Nodes { request_id, nodes };
-                sync_trace_response("send", peer, &response);
+                tracing::debug!(target: "tngl::rpc", %peer, "send {}", summarize_response(&response));
                 write_frame(&mut send, &response).await.map_err(|err| {
                     sync_io_error(
                         format!("incoming peer {peer}: write nodes #{request_id}"),
@@ -285,7 +283,7 @@ pub(crate) async fn handle_connection(
                 let send_list = collect_file_send_list(&ids, peer, &tx).await?;
                 let count = send_list.len();
                 let begin = ResponseMessage::FilesBegin { request_id, count };
-                sync_trace_response("send", peer, &begin);
+                tracing::debug!(target: "tngl::rpc", %peer, "send {}", summarize_response(&begin));
                 write_frame(&mut send, &begin).await.map_err(|err| {
                     sync_io_error(
                         format!("incoming peer {peer}: write FilesBegin #{request_id}"),
@@ -359,7 +357,7 @@ async fn round_trip(
         .await
         .map_err(|err| sync_io_error(format!("peer {peer_id}: open bi stream"), err))?;
 
-    sync_trace_request("send", peer_id, request);
+    tracing::debug!(target: "tngl::rpc", %peer_id, "send {}", summarize_request(request));
     write_frame(&mut send, request)
         .await
         .map_err(|err| sync_io_error(format!("peer {peer_id}: write request"), err))?;
@@ -373,7 +371,7 @@ async fn round_trip(
     assert_eof(&mut recv)
         .await
         .map_err(|err| sync_io_error(format!("peer {peer_id}: assert EOF after response"), err))?;
-    sync_trace_response("recv", peer_id, &response);
+    tracing::debug!(target: "tngl::rpc", %peer_id, "recv {}", summarize_response(&response));
     Ok(response)
 }
 
@@ -428,7 +426,7 @@ async fn request_files(
     })?;
 
     let req = RequestMessage::GetFiles { request_id, ids };
-    sync_trace_request("send", peer_id, &req);
+    tracing::debug!(target: "tngl::rpc", %peer_id, "send {}", summarize_request(&req));
     write_frame(&mut send, &req).await.map_err(|err| {
         sync_io_error(format!("peer {peer_id}: write GetFiles #{request_id}"), err)
     })?;
@@ -445,7 +443,7 @@ async fn request_files(
             err,
         )
     })?;
-    sync_trace_response("recv", peer_id, &resp);
+    tracing::debug!(target: "tngl::rpc", %peer_id, "recv {}", summarize_response(&resp));
     let count = match resp {
         ResponseMessage::FilesBegin {
             request_id: rid,
@@ -561,7 +559,7 @@ pub(crate) async fn send_join_request(
         token: token.to_string(),
         joiner_id,
     };
-    sync_trace_request("send", host_id, &request);
+    tracing::debug!(target: "tngl::rpc", peer = %host_id, "send {}", summarize_request(&request));
     write_frame(&mut send, &request)
         .await
         .map_err(|err| sync_io_error("join: write join request", err))?;
@@ -575,7 +573,7 @@ pub(crate) async fn send_join_request(
     assert_eof(&mut recv)
         .await
         .map_err(|err| sync_io_error("join: assert EOF after join response", err))?;
-    sync_trace_response("recv", host_id, &response);
+    tracing::debug!(target: "tngl::rpc", peer = %host_id, "recv {}", summarize_response(&response));
 
     match response {
         ResponseMessage::JoinAccepted { topic_id, members } => Ok((topic_id, members)),

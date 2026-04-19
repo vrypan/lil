@@ -593,7 +593,7 @@ where
         }
         if let Err(err) = apply_remote_entry_to_disk(sync_dir, &entry, temp_path.as_deref()) {
             // Log and skip — a single bad entry must not crash the daemon.
-            eprintln!("tngl: skipping {}: {err}", entry.id);
+            tracing::warn!(target: "tngl", id = entry.id, "skipping entry: {err}");
             if let Some(ref path) = temp_path {
                 let _ = fs::remove_file(path);
             }

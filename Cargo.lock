@@ -3616,6 +3616,8 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

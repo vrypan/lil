@@ -1,6 +1,6 @@
 use crate::cache::write_cache_file;
 use crate::config::Config;
-use crate::diagnostics::emit_snapshot;
+use crate::diagnostics::{emit_snapshot, summarize_gossip};
 use crate::gossip::{GossipMessage, MemberEntry, MemberStatus};
 use crate::invite::{add_invite, generate_token, now_ms};
 use crate::peers::{load_peers, save_group_state, set_topic_id};
@@ -147,7 +147,7 @@ async fn run_async(config: Config) -> io::Result<()> {
             Ok(event) => {
                 let _ = watch_tx.send(Command::LocalFs(event));
             }
-            Err(err) => eprintln!("watch error: {err}"),
+            Err(err) => tracing::warn!(target: "tngl", "filesystem watch error: {err}"),
         },
         NotifyConfig::default(),
     )
@@ -189,7 +189,7 @@ async fn run_async(config: Config) -> io::Result<()> {
                     }
                 }
                 Ok(_) => {}
-                Err(err) => eprintln!("tngl: gossip receive error: {err}"),
+                Err(err) => tracing::warn!(target: "tngl::gossip", "receive error: {err}"),
             }
         }
     });
@@ -357,14 +357,14 @@ async fn run_async(config: Config) -> io::Result<()> {
                 tokio::spawn(async move {
                     let tmp_dir = sync_dir.join(".tngl");
                     if let Err(err) = sync_peer(endpoint, peer, tx, tmp_dir).await {
-                        eprintln!("peer sync error: {err}");
+                        tracing::warn!(target: "tngl", "peer sync error: {err}");
                     }
                 });
             }
             Command::GossipReceived(message) => {
                 handle_gossip_message(&mut state, &cmd_tx, message).await?;
                 if state.removed_from_group {
-                    eprintln!("tngl: local node removed from group, leaving topic");
+                    tracing::info!(target: "tngl", "removed from group, leaving topic");
                     break;
                 }
             }
@@ -411,10 +411,7 @@ pub fn run_invite(config: Config) -> io::Result<()> {
     let expires_at = now_ms()? + config.invite_expire_secs * 1000;
     add_invite(&config.invites_path, &token, expires_at)?;
     println!("{node_id}:{token}");
-    eprintln!(
-        "tngl: invite valid for {} seconds",
-        config.invite_expire_secs
-    );
+    tracing::info!(target: "tngl", expires_secs = config.invite_expire_secs, "invite token generated");
     Ok(())
 }
 
@@ -440,7 +437,7 @@ pub fn run_join(config: Config, ticket: &str) -> io::Result<()> {
 
         let (topic_id, members) = send_join_request(&endpoint, host_id, token).await?;
         save_group_state(&config.peers_path, topic_id.as_deref(), &members)?;
-        eprintln!("tngl: joined successfully");
+        tracing::info!(target: "tngl", "joined group successfully");
         Ok(())
     })
 }
@@ -518,7 +515,7 @@ pub fn run_remove(config: Config, peer_id: PublicKey) -> io::Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
         router.shutdown().await.map_err(io::Error::other)?;
         gossip.shutdown().await.map_err(io::Error::other)?;
-        eprintln!("tngl: removed peer {target_id}");
+        tracing::info!(target: "tngl", peer = target_id, "peer removed");
         Ok(())
     })
 }
@@ -542,8 +539,8 @@ fn load_or_create_secret_key(path: &Path) -> io::Result<SecretKey> {
 fn print_node_info(endpoint: &Endpoint) -> io::Result<()> {
     let addr = endpoint.watch_addr().get();
     let addr_json = serde_json::to_string(&addr).map_err(io::Error::other)?;
-    eprintln!("tngl node-id {}", endpoint.id());
-    eprintln!("tngl peer {addr_json}");
+    tracing::info!(target: "tngl", node_id = %endpoint.id(), "node started");
+    tracing::info!(target: "tngl", addr = addr_json, "listening");
     Ok(())
 }
 
@@ -573,12 +570,13 @@ async fn publish_gossip(state: &State, message: GossipMessage) {
     if state.removed_from_group {
         return;
     }
+    tracing::debug!(target: "tngl::gossip", "send {}", summarize_gossip(&message));
     if let Err(err) = state
         .gossip_sender
         .broadcast(message.to_bytes().into())
         .await
     {
-        eprintln!("tngl: gossip publish error: {err}");
+        tracing::warn!(target: "tngl::gossip", "publish error: {err}");
     }
 }
 
@@ -653,6 +651,7 @@ async fn handle_gossip_message(
     if message.origin() == state.local_origin {
         return Ok(());
     }
+    tracing::debug!(target: "tngl::gossip", "recv {}", summarize_gossip(&message));
     match message {
         GossipMessage::FileChanged {
             origin,
@@ -699,7 +698,7 @@ async fn handle_gossip_message(
                         let _ = reply_rx.await;
                     }
                     Err(err) => {
-                        eprintln!("tngl: gossip fetch error from {peer_id}: {err}");
+                        tracing::warn!(target: "tngl", %peer_id, "gossip fetch failed, falling back to full sync: {err}");
                         let _ = tx.send(Command::SyncPeer(EndpointAddr::new(peer_id)));
                     }
                 }
