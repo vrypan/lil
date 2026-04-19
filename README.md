@@ -104,8 +104,8 @@ Join from node B:
 ./target/release/tngl --folder /tmp/node-b --join '<NODE_ID>:<TOKEN>'
 ```
 
-After joining, the daemon starts normally and persists the peer list in
-`/tmp/node-b/.tngl/peers.json`.
+`--join` performs the join handshake, saves the peer list to
+`/tmp/node-b/.tngl/peers.json`, and then starts the daemon normally.
 
 ## Useful Flags
 
@@ -131,6 +131,13 @@ Remove a peer from the membership ledger and broadcast the update:
 
 ```bash
 ./target/release/tngl --folder /tmp/node-a --remove-peer <NODE_ID>
+```
+
+Set how often `SyncState` is broadcast (default 10 seconds). Lower values
+speed up repair at the cost of more gossip traffic:
+
+```bash
+./target/release/tngl --folder /tmp/node-a --sync-state-interval 30
 ```
 
 ## Ignore Rules
@@ -166,13 +173,19 @@ tombstones and newly unignored paths can reappear.
 
 ## Notes
 
-- `.tngl/` is always ignored by sync.
-- live replication uses gossip announcements plus direct `GetFiles` pulls; file
-  content is not pushed proactively to every peer.
-- Some OS metadata files are also ignored automatically, such as `.DS_Store`,
-  `Thumbs.db`, `Desktop.ini`, `._*`, `.Spotlight-V100`, and `$RECYCLE.BIN`.
+- `.tngl/` is always ignored by sync; it also holds temporary files during
+  in-flight transfers (`recv-*`), which are removed on completion or error.
+- Live replication uses gossip announcements plus direct `GetFiles` pulls.
+  File content is streamed over QUIC without buffering the whole file in memory;
+  the blake3 hash is verified before the temp file is moved into place.
+- If a targeted `GetFiles` fetch fails, the node falls back to a full Merkle
+  tree sync (`GetNodes` walk) against the same peer.
+- Repair is also driven by periodic `SyncState` broadcasts (default every
+  10 seconds). Any node with a different root hash initiates a tree sync.
+- Some OS metadata files are ignored automatically: `.DS_Store`, `Thumbs.db`,
+  `Desktop.ini`, `._*`, `.Spotlight-V100`, and `$RECYCLE.BIN`.
 - Empty directories are not tracked as first-class state. If the last file in a
-  directory is deleted, the empty directory may be removed on peers.
+  directory is deleted, the empty directory is removed on peers.
 
 ## Debugging
 

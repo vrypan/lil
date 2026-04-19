@@ -117,7 +117,7 @@ async fn run_async(config: Config) -> io::Result<()> {
     peers.retain(|peer| peer.id != endpoint.id());
     dedupe_peers(&mut peers);
 
-    let mut allowlist: HashSet<PublicKey> = config.allow_peers.into_iter().collect();
+    let mut allowlist: HashSet<PublicKey> = HashSet::new();
     for peer_id in &config.peer_ids {
         allowlist.insert(*peer_id);
     }

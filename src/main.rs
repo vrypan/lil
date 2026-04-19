@@ -44,14 +44,6 @@ struct Cli {
     )]
     peers: Vec<EndpointAddr>,
 
-    #[arg(
-        long = "allow-peer",
-        value_name = "NODE_ID",
-        action = clap::ArgAction::Append,
-        help = "Additional allowlisted peer node IDs"
-    )]
-    allow_peers: Vec<PublicKey>,
-
     #[arg(long = "show-id", help = "Print the node ID then exit")]
     show_id: bool,
 
@@ -120,7 +112,6 @@ fn run_cli() -> io::Result<()> {
         invites_path: state_dir.join("pending_invites.json"),
         peer_ids: cli.peer_ids,
         peers: cli.peers,
-        allow_peers: cli.allow_peers,
         show_id: cli.show_id,
         rescan: cli.rescan,
         sync_state_interval_secs: cli.sync_state_interval_secs,

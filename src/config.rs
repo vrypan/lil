@@ -10,7 +10,7 @@ pub struct Config {
     pub invites_path: PathBuf,
     pub peer_ids: Vec<PublicKey>,
     pub peers: Vec<EndpointAddr>,
-    pub allow_peers: Vec<PublicKey>,
+
     pub show_id: bool,
     pub rescan: bool,
     pub sync_state_interval_secs: u64,

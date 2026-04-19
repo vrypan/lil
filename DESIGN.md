@@ -149,10 +149,11 @@ is streamed separately on the QUIC stream.
 3. Publish `FileChanged` to gossip topic
 4. Receiving peers: `should_accept_remote` check, then `GetFiles([id])` from origin
 
-### Repair (startup / reconnect)
+### Repair (startup and periodic)
 
 1. Subscribe to gossip topic
-2. Publish `SyncState` (current root hash + lamport)
+2. Publish `SyncState` (current root hash + lamport); also published on a
+   configurable interval (default 10 s) so out-of-sync peers self-repair
 3. Peers with a different root hash initiate a `GetNodes` tree walk
 4. Walk recurses into differing subtrees; collects differing files for `GetFiles`
 
@@ -179,7 +180,8 @@ Published on every local file write or deletion. No debouncing.
 
 ### `SyncState`
 
-Published on startup or topic rejoin.
+Published on startup and periodically (default every 10 seconds, configurable
+with `--sync-state-interval`).
 
 ```json
 {
@@ -268,12 +270,15 @@ All state lives in `<sync-folder>/.tngl/`:
 ```json
 {
   "topic_id": "<iroh-gossip topic hex>",
-  "peers": ["<node-id>", "<node-id>"]
+  "members": [
+    { "id": "<node-id>", "status": "active",  "lamport": 42  },
+    { "id": "<node-id>", "status": "removed", "lamport": 105 }
+  ]
 }
 ```
 
 - `topic_id`: absent until the node has joined a group
-- `peers`: all known group members, **excluding self**
+- `members`: full membership ledger, including self and removed members
 
 `MemberList` gossip keeps `peers.json` consistent across nodes. On any
 membership change a `MemberList` is broadcast; receivers update their own
@@ -315,7 +320,7 @@ ticket, so they are always fresh.
 3. Inviter adds joiner to its member list
 4. Inviter sends `JoinAccepted` with `topic_id` and full member list (including self)
 5. Inviter publishes updated `MemberList` to the topic
-6. Joiner strips self from members, writes `peers.json`
+6. Joiner writes the full member list (including self) to `peers.json`
 7. Joiner subscribes to topic, publishes `SyncState`
 8. Joiner starts pull sync from inviter
 
@@ -357,7 +362,7 @@ transport-level deduplication.
 | Message | Published by | When |
 |---|---|---|
 | `FileChanged` | any node | on every local write or deletion |
-| `SyncState` | any node | on startup / topic rejoin |
+| `SyncState` | any node | on startup and periodically |
 | `MemberList` | any node | after join/removal and periodically |
 
 ### Sync RPCs
@@ -373,7 +378,7 @@ transport-level deduplication.
 - **`peers.json` is restart state**: holds `topic_id` + peer list; no separate group config
 - **`MemberList` is the full ledger**: active + removed members with per-entry lamports; uniform merge rule; no separate join/remove messages
 - **`MemberList` includes self**: the publisher includes its own entry so receivers have a complete picture
-- **`JoinAccepted.members` includes inviter**: joiner strips self and saves the rest
+- **`JoinAccepted.members` includes inviter**: joiner saves the full list (including self) as the membership ledger
 - **Topic = group identity**: no separate group name
 - **Minimal ticket**: `<node-id>:<token>` only; group state comes from `JoinAccepted`
 - **No debouncing**: every write produces one `FileChanged`; deduplication at receiver
