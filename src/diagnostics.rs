@@ -70,8 +70,5 @@ pub(crate) fn summarize_gossip(message: &GossipMessage) -> String {
 }
 
 fn hex4(hash: &[u8; 32]) -> String {
-    hash[..4]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    hash[..4].iter().map(|byte| format!("{byte:02x}")).collect()
 }

@@ -55,6 +55,7 @@ pub(crate) enum Command {
     GossipReceived(GossipMessage),
     PublishSyncState,
     PublishMemberList,
+    EndpointAddrChanged(EndpointAddr),
 }
 
 struct State {
@@ -185,6 +186,14 @@ async fn run_async(config: Config) -> io::Result<()> {
                 Ok(_) => {}
                 Err(err) => tracing::warn!(target: "tngl::gossip", "receive error: {err}"),
             }
+        }
+    });
+
+    let mut addr_watcher = state_endpoint_addr_watcher(&endpoint);
+    let addr_tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        while let Ok(addr) = addr_watcher.updated().await {
+            let _ = addr_tx.send(Command::EndpointAddrChanged(addr));
         }
     });
 
@@ -380,6 +389,11 @@ async fn run_async(config: Config) -> io::Result<()> {
                 let message = build_member_list_msg(&state.local_origin, &state.members);
                 publish_gossip(&state, message).await;
             }
+            Command::EndpointAddrChanged(addr) => {
+                let addr_json = serde_json::to_string(&addr).map_err(io::Error::other)?;
+                tracing::info!(target: "tngl", addr = addr_json, "endpoint address changed, reconnecting");
+                reconnect_gossip(&state, &cmd_tx).await;
+            }
         }
     }
 
@@ -570,6 +584,10 @@ fn print_node_info(endpoint: &Endpoint) -> io::Result<()> {
     Ok(())
 }
 
+fn state_endpoint_addr_watcher(endpoint: &Endpoint) -> impl Watcher<Value = EndpointAddr> + use<> {
+    endpoint.watch_addr()
+}
+
 fn dedupe_peers(peers: &mut Vec<EndpointAddr>) {
     let mut seen = HashSet::new();
     peers.retain(|peer| seen.insert(peer.id));
@@ -603,6 +621,20 @@ async fn publish_gossip(state: &State, message: GossipMessage) {
         .await
     {
         tracing::warn!(target: "tngl::gossip", "publish error: {err}");
+    }
+}
+
+async fn reconnect_gossip(state: &State, cmd_tx: &mpsc::UnboundedSender<Command>) {
+    let peer_ids: Vec<PublicKey> = state.peers.iter().map(|peer| peer.id).collect();
+    if !peer_ids.is_empty() {
+        if let Err(err) = state.gossip_sender.join_peers(peer_ids).await {
+            tracing::warn!(target: "tngl::gossip", "join_peers failed during reconnect: {err}");
+        }
+    }
+    let _ = cmd_tx.send(Command::PublishSyncState);
+    let _ = cmd_tx.send(Command::PublishMemberList);
+    for peer in state.peers.iter().cloned() {
+        let _ = cmd_tx.send(Command::SyncPeer(peer));
     }
 }
 

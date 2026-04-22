@@ -121,4 +121,3 @@ fn run_cli() -> io::Result<()> {
 
     run(config)
 }
-
