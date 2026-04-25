@@ -1,0 +1,342 @@
+use crate::state::hex;
+use iroh::PublicKey;
+use iroh_gossip::TopicId;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberStatus {
+    Active,
+    Removed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemberEntry {
+    pub id: String,
+    pub status: MemberStatus,
+    pub lamport: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PeersFile {
+    topic_id: String,
+    #[serde(default)]
+    members: Vec<MemberEntry>,
+}
+
+#[derive(Debug)]
+pub struct GroupState {
+    path: PathBuf,
+    local_id: String,
+    topic_id: TopicId,
+    members: BTreeMap<String, MemberEntry>,
+}
+
+#[derive(Debug)]
+pub struct MemberMerge {
+    pub changed: bool,
+    pub removed_self: bool,
+    pub active_peers: Vec<PublicKey>,
+}
+
+impl GroupState {
+    pub fn load_or_init(path: PathBuf, local_id: PublicKey) -> io::Result<Self> {
+        let local_id = local_id.to_string();
+        let loaded = match fs::read_to_string(&path) {
+            Ok(contents) => Some(serde_json::from_str::<PeersFile>(&contents).map_err(|err| {
+                io::Error::other(format!("invalid peers file {}: {err}", path.display()))
+            })?),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
+
+        let topic_id = match loaded.as_ref() {
+            Some(file) => parse_topic_id(&file.topic_id)?,
+            None => new_topic_id()?,
+        };
+        let mut members: BTreeMap<String, MemberEntry> = loaded
+            .map(|file| {
+                file.members
+                    .into_iter()
+                    .map(|entry| (entry.id.clone(), entry))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !members.contains_key(&local_id) {
+            let lamport = next_lamport(&members);
+            members.insert(
+                local_id.clone(),
+                MemberEntry {
+                    id: local_id.clone(),
+                    status: MemberStatus::Active,
+                    lamport,
+                },
+            );
+        }
+
+        let state = Self {
+            path,
+            local_id,
+            topic_id,
+            members,
+        };
+        state.persist()?;
+        Ok(state)
+    }
+
+    pub fn replace(path: &Path, topic_id: TopicId, members: Vec<MemberEntry>) -> io::Result<()> {
+        save_peers_file(path, topic_id, members)
+    }
+
+    pub fn topic_id(&self) -> TopicId {
+        self.topic_id
+    }
+
+    pub fn members(&self) -> Vec<MemberEntry> {
+        self.members.values().cloned().collect()
+    }
+
+    pub fn active_peers(&self) -> Vec<PublicKey> {
+        active_peers_from_members(&self.local_id, self.members.values())
+    }
+
+    pub fn is_active_member(&self, peer: &PublicKey) -> bool {
+        self.members
+            .get(&peer.to_string())
+            .is_some_and(|entry| entry.status == MemberStatus::Active)
+    }
+
+    pub fn add_active_peer(&mut self, peer: PublicKey) -> io::Result<bool> {
+        let id = peer.to_string();
+        let lamport = next_lamport(&self.members);
+        let changed = match self.members.get_mut(&id) {
+            Some(entry) if entry.status == MemberStatus::Active => false,
+            Some(entry) => {
+                entry.status = MemberStatus::Active;
+                entry.lamport = lamport;
+                true
+            }
+            None => {
+                self.members.insert(
+                    id.clone(),
+                    MemberEntry {
+                        id,
+                        status: MemberStatus::Active,
+                        lamport,
+                    },
+                );
+                true
+            }
+        };
+        if changed {
+            self.persist()?;
+        }
+        Ok(changed)
+    }
+
+    pub fn merge_members(&mut self, incoming: Vec<MemberEntry>) -> io::Result<MemberMerge> {
+        let mut changed = false;
+        let mut removed_self = false;
+
+        for entry in incoming {
+            let apply = self
+                .members
+                .get(&entry.id)
+                .is_none_or(|local| entry.lamport > local.lamport);
+            if !apply {
+                continue;
+            }
+            if entry.id == self.local_id && entry.status == MemberStatus::Removed {
+                removed_self = true;
+            }
+            self.members.insert(entry.id.clone(), entry);
+            changed = true;
+        }
+
+        if changed {
+            self.persist()?;
+        }
+
+        Ok(MemberMerge {
+            changed,
+            removed_self,
+            active_peers: self.active_peers(),
+        })
+    }
+
+    fn persist(&self) -> io::Result<()> {
+        save_peers_file(&self.path, self.topic_id, self.members())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingInvite {
+    secret_hash: String,
+    expires_at_ms: u64,
+}
+
+pub fn add_invite(path: &Path, secret: &str, expires_at_ms: u64) -> io::Result<()> {
+    let mut invites = load_invites(path)?;
+    let now = now_ms()?;
+    invites.retain(|invite| invite.expires_at_ms > now);
+    invites.push(PendingInvite {
+        secret_hash: hash_secret(secret),
+        expires_at_ms,
+    });
+    save_invites(path, &invites)
+}
+
+pub fn consume_invite(path: &Path, secret: &str) -> io::Result<bool> {
+    let mut invites = load_invites(path)?;
+    let now = now_ms()?;
+    let secret_hash = hash_secret(secret);
+    let mut found = false;
+
+    invites.retain(|invite| {
+        if invite.expires_at_ms <= now {
+            return false;
+        }
+        if invite.secret_hash == secret_hash {
+            found = true;
+            return false;
+        }
+        true
+    });
+
+    save_invites(path, &invites)?;
+    Ok(found)
+}
+
+pub fn generate_secret() -> io::Result<String> {
+    let mut bytes = [0u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(hex(bytes))
+}
+
+pub fn now_ms() -> io::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(io::Error::other)
+}
+
+fn active_peers_from_members<'a>(
+    local_id: &str,
+    members: impl IntoIterator<Item = &'a MemberEntry>,
+) -> Vec<PublicKey> {
+    members
+        .into_iter()
+        .filter(|entry| entry.id != local_id)
+        .filter(|entry| entry.status == MemberStatus::Active)
+        .filter_map(|entry| entry.id.parse().ok())
+        .collect()
+}
+
+fn new_topic_id() -> io::Result<TopicId> {
+    let mut bytes = [0_u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(TopicId::from_bytes(bytes))
+}
+
+fn parse_topic_id(value: &str) -> io::Result<TopicId> {
+    value
+        .parse()
+        .map_err(|err| io::Error::other(format!("invalid stored topic id: {err}")))
+}
+
+fn save_peers_file(
+    path: &Path,
+    topic_id: TopicId,
+    mut members: Vec<MemberEntry>,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    members.sort_by(|left, right| left.id.cmp(&right.id));
+    let file = PeersFile {
+        topic_id: hex(*topic_id.as_bytes()),
+        members,
+    };
+    let json = serde_json::to_string_pretty(&file).map_err(io::Error::other)?;
+    fs::write(path, json)
+}
+
+fn next_lamport(members: &BTreeMap<String, MemberEntry>) -> u64 {
+    members
+        .values()
+        .map(|entry| entry.lamport)
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+fn load_invites(path: &Path) -> io::Result<Vec<PendingInvite>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents).map_err(io::Error::other),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+fn save_invites(path: &Path, invites: &[PendingInvite]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(invites).map_err(io::Error::other)?;
+    fs::write(path, json)
+}
+
+fn hash_secret(secret: &str) -> String {
+    hex(*blake3::hash(secret.as_bytes()).as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invite_is_one_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("invites.json");
+
+        add_invite(&path, "secret", now_ms().unwrap() + 10_000).unwrap();
+
+        assert!(consume_invite(&path, "secret").unwrap());
+        assert!(!consume_invite(&path, "secret").unwrap());
+    }
+
+    #[test]
+    fn member_merge_keeps_newest_lamport() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let mut state = GroupState::load_or_init(tmp.path().join("peers.json"), local).unwrap();
+
+        let peer_id = peer.to_string();
+        let update = state
+            .merge_members(vec![MemberEntry {
+                id: peer_id.clone(),
+                status: MemberStatus::Active,
+                lamport: 2,
+            }])
+            .unwrap();
+        assert!(update.changed);
+        assert_eq!(update.active_peers, vec![peer]);
+
+        let update = state
+            .merge_members(vec![MemberEntry {
+                id: peer_id,
+                status: MemberStatus::Removed,
+                lamport: 1,
+            }])
+            .unwrap();
+        assert!(!update.changed);
+        assert_eq!(update.active_peers, vec![peer]);
+    }
+}

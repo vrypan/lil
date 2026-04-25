@@ -1,3 +1,4 @@
+use crate::group::{self, GroupState, MemberEntry};
 use crate::protocol::{
     RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, write_frame,
 };
@@ -7,9 +8,10 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, PublicKey};
 use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 pub const ALPN: &[u8] = b"tngl/rpc/1";
 
@@ -22,11 +24,29 @@ fn next_request_id() -> u64 {
 #[derive(Debug, Clone)]
 pub struct FolderRpc {
     state: Arc<RwLock<FolderState>>,
+    group: Arc<RwLock<GroupState>>,
+    invites_path: Arc<PathBuf>,
+    events: mpsc::UnboundedSender<RpcEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RpcEvent {
+    PeerJoined { peer: PublicKey },
 }
 
 impl FolderRpc {
-    pub fn new(state: Arc<RwLock<FolderState>>) -> Self {
-        Self { state }
+    pub fn new(
+        state: Arc<RwLock<FolderState>>,
+        group: Arc<RwLock<GroupState>>,
+        invites_path: PathBuf,
+        events: mpsc::UnboundedSender<RpcEvent>,
+    ) -> Self {
+        Self {
+            state,
+            group,
+            invites_path: Arc::new(invites_path),
+            events,
+        }
     }
 }
 
@@ -129,6 +149,38 @@ impl RpcClient {
         }
     }
 
+    pub async fn join_group(
+        &self,
+        peer: PublicKey,
+        secret: String,
+        joiner_id: PublicKey,
+    ) -> io::Result<(String, Vec<MemberEntry>)> {
+        let request_id = next_request_id();
+        let request = RequestMessage::Join {
+            request_id,
+            secret,
+            joiner_id: joiner_id.to_string(),
+        };
+        match self.round_trip(peer, request).await? {
+            ResponseMessage::JoinAccepted {
+                request_id: actual,
+                topic_id,
+                members,
+            } if actual == request_id => Ok((topic_id, members)),
+            ResponseMessage::JoinRejected {
+                request_id: actual,
+                reason,
+            } if actual == request_id => Err(io::Error::other(reason)),
+            ResponseMessage::Error {
+                request_id: actual,
+                message,
+            } if actual == request_id => Err(io::Error::other(message)),
+            response => Err(io::Error::other(format!(
+                "unexpected Join response from {peer}: {response:?}"
+            ))),
+        }
+    }
+
     async fn round_trip(
         &self,
         peer: PublicKey,
@@ -171,15 +223,24 @@ impl RpcClient {
 
 impl ProtocolHandler for FolderRpc {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        handle_connection(connection, Arc::clone(&self.state))
-            .await
-            .map_err(AcceptError::from_err)
+        handle_connection(
+            connection,
+            Arc::clone(&self.state),
+            Arc::clone(&self.group),
+            Arc::clone(&self.invites_path),
+            self.events.clone(),
+        )
+        .await
+        .map_err(AcceptError::from_err)
     }
 }
 
 async fn handle_connection(
     connection: Connection,
     state: Arc<RwLock<FolderState>>,
+    group: Arc<RwLock<GroupState>>,
+    invites_path: Arc<PathBuf>,
+    events: mpsc::UnboundedSender<RpcEvent>,
 ) -> io::Result<()> {
     let peer = connection.remote_id();
     tracing::debug!(target: "tngl::rpc", %peer, "incoming connection");
@@ -202,7 +263,7 @@ async fn handle_connection(
             .await
             .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
 
-        let response = handle_request(request, &state).await;
+        let response = handle_request(request, peer, &state, &group, &invites_path, &events).await;
         tracing::debug!(target: "tngl::rpc", %peer, "send {:?}", response);
         write_frame(&mut send, &response)
             .await
@@ -215,10 +276,59 @@ async fn handle_connection(
 
 async fn handle_request(
     request: RequestMessage,
+    peer: PublicKey,
     state: &Arc<RwLock<FolderState>>,
+    group: &Arc<RwLock<GroupState>>,
+    invites_path: &PathBuf,
+    events: &mpsc::UnboundedSender<RpcEvent>,
 ) -> ResponseMessage {
     match request {
+        RequestMessage::Join {
+            request_id,
+            secret,
+            joiner_id,
+        } => {
+            if joiner_id != peer.to_string() {
+                return ResponseMessage::JoinRejected {
+                    request_id,
+                    reason: "joiner id does not match RPC peer".to_string(),
+                };
+            }
+            match group::consume_invite(invites_path, &secret) {
+                Ok(true) => {
+                    let mut group = group.write().await;
+                    match group.add_active_peer(peer) {
+                        Ok(_) => {
+                            let _ = events.send(RpcEvent::PeerJoined { peer });
+                            ResponseMessage::JoinAccepted {
+                                request_id,
+                                topic_id: hex(*group.topic_id().as_bytes()),
+                                members: group.members(),
+                            }
+                        }
+                        Err(err) => ResponseMessage::JoinRejected {
+                            request_id,
+                            reason: format!("could not add peer: {err}"),
+                        },
+                    }
+                }
+                Ok(false) => ResponseMessage::JoinRejected {
+                    request_id,
+                    reason: "invalid or expired ticket".to_string(),
+                },
+                Err(err) => ResponseMessage::JoinRejected {
+                    request_id,
+                    reason: format!("could not validate ticket: {err}"),
+                },
+            }
+        }
         RequestMessage::GetRoot { request_id } => {
+            if !group.read().await.is_active_member(&peer) {
+                return ResponseMessage::Error {
+                    request_id,
+                    message: "peer is not a group member".to_string(),
+                };
+            }
             let state = state.read().await;
             ResponseMessage::Root {
                 request_id,
@@ -228,6 +338,12 @@ async fn handle_request(
             }
         }
         RequestMessage::GetNode { request_id, prefix } => {
+            if !group.read().await.is_active_member(&peer) {
+                return ResponseMessage::Error {
+                    request_id,
+                    message: "peer is not a group member".to_string(),
+                };
+            }
             let state = state.read().await;
             ResponseMessage::Node {
                 request_id,
@@ -235,6 +351,12 @@ async fn handle_request(
             }
         }
         RequestMessage::GetEntry { request_id, path } => {
+            if !group.read().await.is_active_member(&peer) {
+                return ResponseMessage::Error {
+                    request_id,
+                    message: "peer is not a group member".to_string(),
+                };
+            }
             let state = state.read().await;
             ResponseMessage::Entry {
                 request_id,
@@ -245,6 +367,12 @@ async fn handle_request(
             request_id,
             content_hash,
         } => {
+            if !group.read().await.is_active_member(&peer) {
+                return ResponseMessage::Error {
+                    request_id,
+                    message: "peer is not a group member".to_string(),
+                };
+            }
             let path = {
                 let state = state.read().await;
                 state.object_path(content_hash)

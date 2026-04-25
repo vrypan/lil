@@ -1,3 +1,4 @@
+use crate::group::MemberEntry;
 use crate::state::{Entry, TreeNode};
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -5,6 +6,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RequestMessage {
+    Join {
+        request_id: u64,
+        secret: String,
+        joiner_id: String,
+    },
     GetRoot {
         request_id: u64,
     },
@@ -24,6 +30,15 @@ pub enum RequestMessage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ResponseMessage {
+    JoinAccepted {
+        request_id: u64,
+        topic_id: String,
+        members: Vec<MemberEntry>,
+    },
+    JoinRejected {
+        request_id: u64,
+        reason: String,
+    },
     Root {
         request_id: u64,
         state_root: [u8; 32],

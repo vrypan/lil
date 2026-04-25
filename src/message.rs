@@ -1,3 +1,4 @@
+use crate::group::MemberEntry;
 use crate::state::{Change, EntryKind};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -17,6 +18,10 @@ pub enum GossipMessage {
         live_root: [u8; 32],
         lamport: u64,
         changes: Vec<WireChange>,
+    },
+    Peers {
+        origin: String,
+        members: Vec<MemberEntry>,
     },
 }
 
@@ -44,6 +49,7 @@ impl GossipMessage {
         match self {
             Self::SyncState { origin, .. } => origin,
             Self::FilesystemChanged { origin, .. } => origin,
+            Self::Peers { origin, .. } => origin,
         }
     }
 }
@@ -105,6 +111,24 @@ mod tests {
         let parsed = GossipMessage::from_bytes(&message.to_bytes()).unwrap();
         match parsed {
             GossipMessage::FilesystemChanged { changes, .. } => assert_eq!(changes.len(), 1),
+            _ => panic!("wrong message variant"),
+        }
+    }
+
+    #[test]
+    fn peers_roundtrips() {
+        let message = GossipMessage::Peers {
+            origin: "node-a".to_string(),
+            members: vec![MemberEntry {
+                id: "node-a".to_string(),
+                status: crate::group::MemberStatus::Active,
+                lamport: 1,
+            }],
+        };
+
+        let parsed = GossipMessage::from_bytes(&message.to_bytes()).unwrap();
+        match parsed {
+            GossipMessage::Peers { members, .. } => assert_eq!(members.len(), 1),
             _ => panic!("wrong message variant"),
         }
     }

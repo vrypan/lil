@@ -1,3 +1,4 @@
+mod group;
 mod message;
 mod protocol;
 mod rpc;
@@ -5,6 +6,7 @@ mod state;
 mod sync;
 mod watcher;
 
+use crate::group::GroupState;
 use crate::message::{GossipMessage, WireChange};
 use crate::state::{Change, FolderState, hex};
 use clap::Parser;
@@ -21,6 +23,8 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 
 const KEY_FILE: &str = "private.key";
+const PEERS_FILE: &str = "peers.json";
+const INVITES_FILE: &str = "invites.json";
 
 #[derive(Parser, Debug)]
 #[command(name = "tngl", about = "Monitor a folder and gossip tngl tree changes")]
@@ -28,7 +32,22 @@ struct Cli {
     #[arg(long, value_name = "PATH", help = "Folder to monitor")]
     folder: PathBuf,
 
-    #[arg(long, value_name = "TICKET", help = "Join an existing gossip topic")]
+    #[arg(long, help = "Create a one-time group join ticket and exit")]
+    invite: bool,
+
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value = "3600",
+        help = "Ticket lifetime when used with --invite"
+    )]
+    expire_secs: u64,
+
+    #[arg(
+        long,
+        value_name = "TICKET",
+        help = "Join a group using <node_id>:<secret>"
+    )]
     ticket: Option<String>,
 
     #[arg(
@@ -52,9 +71,9 @@ struct Cli {
 }
 
 #[derive(Debug, Clone)]
-struct Ticket {
-    topic: TopicId,
-    bootstrap: Vec<PublicKey>,
+struct JoinTicket {
+    issuer: PublicKey,
+    secret: String,
 }
 
 #[tokio::main]
@@ -79,6 +98,11 @@ async fn run() -> io::Result<()> {
 
     let state_dir = cli.folder.join(".tngl");
     fs::create_dir_all(&state_dir)?;
+
+    if cli.invite {
+        return create_invite(&state_dir, cli.expire_secs);
+    }
+
     let _lock = acquire_daemon_lock(&state_dir)?;
 
     let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
@@ -90,24 +114,36 @@ async fn run() -> io::Result<()> {
         .map_err(io::Error::other)?;
 
     let local_origin = endpoint.id().to_string();
+    let peers_path = state_dir.join(PEERS_FILE);
+    let invites_path = state_dir.join(INVITES_FILE);
+    if let Some(ticket) = cli.ticket.as_deref() {
+        join_group(&endpoint, &peers_path, ticket).await?;
+    }
+    let group = Arc::new(RwLock::new(GroupState::load_or_init(
+        peers_path,
+        endpoint.id(),
+    )?));
+    let topic_id = group.read().await.topic_id();
+    let bootstrap = group.read().await.active_peers();
     let state = Arc::new(RwLock::new(FolderState::new(
         cli.folder.clone(),
         local_origin.clone(),
     )?));
-    let ticket = match cli.ticket.as_deref() {
-        Some(ticket) => parse_ticket(ticket)?,
-        None => Ticket {
-            topic: new_topic_id()?,
-            bootstrap: Vec::new(),
-        },
-    };
 
     {
         let state = state.read().await;
-        print_start(&state, &endpoint, &ticket, cli.poll, cli.interval_ms);
+        print_start(
+            &state,
+            &endpoint,
+            topic_id,
+            &bootstrap,
+            cli.poll,
+            cli.interval_ms,
+        );
     }
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel();
+    let (rpc_event_tx, mut rpc_event_rx) = mpsc::unbounded_channel();
     let watch_root = state.read().await.root().to_path_buf();
     let _watcher = watcher::spawn(watch_root, cli.interval_ms, cli.poll, fs_tx)?;
 
@@ -115,19 +151,33 @@ async fn run() -> io::Result<()> {
     let rpc_client = rpc::RpcClient::new(endpoint.clone());
     let _router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
-        .accept(rpc::ALPN, rpc::FolderRpc::new(Arc::clone(&state)))
+        .accept(
+            rpc::ALPN,
+            rpc::FolderRpc::new(
+                Arc::clone(&state),
+                Arc::clone(&group),
+                invites_path,
+                rpc_event_tx,
+            ),
+        )
         .spawn();
 
     let topic = gossip
-        .subscribe(ticket.topic, ticket.bootstrap.clone())
+        .subscribe(topic_id, bootstrap.clone())
         .await
         .map_err(io::Error::other)?;
     let (sender, mut receiver) = topic.split();
+    if !bootstrap.is_empty() {
+        if let Err(err) = sender.join_peers(bootstrap).await {
+            tracing::warn!("join known peers failed: {err}");
+        }
+    }
 
     {
         let state = state.read().await;
         publish_sync_state(&sender, &StateSnapshot::from_state(&state), &local_origin).await;
     }
+    publish_peers(&sender, Arc::clone(&group), &local_origin).await;
 
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(cli.announce_interval_secs.max(1)));
@@ -164,8 +214,21 @@ async fn run() -> io::Result<()> {
                     event,
                     rpc_client.clone(),
                     Arc::clone(&state),
+                    Arc::clone(&group),
+                    &sender,
                     &local_origin,
                 ).await?;
+            }
+            Some(event) = rpc_event_rx.recv() => {
+                match event {
+                    rpc::RpcEvent::PeerJoined { peer } => {
+                        tracing::info!("peer joined {peer}");
+                        if let Err(err) = sender.join_peers(vec![peer]).await {
+                            tracing::warn!("join new peer failed: {err}");
+                        }
+                        publish_peers(&sender, Arc::clone(&group), &local_origin).await;
+                    }
+                }
             }
             _ = announce_interval.tick() => {
                 let snapshot = {
@@ -173,6 +236,7 @@ async fn run() -> io::Result<()> {
                     StateSnapshot::from_state(&state)
                 };
                 publish_sync_state(&sender, &snapshot, &local_origin).await;
+                publish_peers(&sender, Arc::clone(&group), &local_origin).await;
             }
         }
     }
@@ -227,6 +291,15 @@ async fn publish_filesystem_changed(
     publish(sender, message).await;
 }
 
+async fn publish_peers(sender: &GossipSender, group: Arc<RwLock<GroupState>>, origin: &str) {
+    let members = group.read().await.members();
+    let message = GossipMessage::Peers {
+        origin: origin.to_string(),
+        members,
+    };
+    publish(sender, message).await;
+}
+
 async fn publish(sender: &GossipSender, message: GossipMessage) {
     tracing::debug!("gossip send {}", summarize_message(&message));
     if let Err(err) = sender.broadcast(message.to_bytes().into()).await {
@@ -238,6 +311,8 @@ async fn handle_gossip_event(
     event: Result<GossipEvent, ApiError>,
     rpc_client: rpc::RpcClient,
     state: Arc<RwLock<FolderState>>,
+    group: Arc<RwLock<GroupState>>,
+    sender: &GossipSender,
     local_origin: &str,
 ) -> io::Result<()> {
     match event {
@@ -249,12 +324,30 @@ async fn handle_gossip_event(
             if message.origin() == local_origin {
                 return Ok(());
             }
+            if !is_active_origin(&group, message.origin()).await {
+                tracing::debug!("ignored gossip from non-member {}", message.origin());
+                return Ok(());
+            }
             let local = {
                 let state = state.read().await;
                 StateSnapshot::from_state(&state)
             };
             print_remote_message(&message, &local);
-            maybe_probe_remote_rpc(rpc_client, message, state);
+            match &message {
+                GossipMessage::Peers { members, .. } => {
+                    let update = group.write().await.merge_members(members.clone())?;
+                    if update.changed {
+                        tracing::info!("peers updated active={}", update.active_peers.len());
+                        if let Err(err) = sender.join_peers(update.active_peers).await {
+                            tracing::warn!("join peers from gossip failed: {err}");
+                        }
+                        if update.removed_self {
+                            tracing::warn!("this node is marked removed from the group");
+                        }
+                    }
+                }
+                _ => maybe_probe_remote_rpc(rpc_client, message, state),
+            }
         }
         Ok(GossipEvent::NeighborUp(endpoint_id)) => {
             tracing::info!("gossip neighbor up {endpoint_id}");
@@ -268,6 +361,13 @@ async fn handle_gossip_event(
         Err(err) => tracing::warn!("gossip receive failed: {err}"),
     }
     Ok(())
+}
+
+async fn is_active_origin(group: &Arc<RwLock<GroupState>>, origin: &str) -> bool {
+    let Ok(peer) = origin.parse::<PublicKey>() else {
+        return false;
+    };
+    group.read().await.is_active_member(&peer)
 }
 
 fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
@@ -319,6 +419,9 @@ fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
                 );
             }
         }
+        GossipMessage::Peers { origin, members } => {
+            tracing::info!("peer list origin={} members={}", origin, members.len());
+        }
     }
 }
 
@@ -340,6 +443,7 @@ fn maybe_probe_remote_rpc(
             live_root,
             ..
         } => (origin, state_root, live_root),
+        GossipMessage::Peers { .. } => return,
     };
     let Ok(peer) = origin.parse::<PublicKey>() else {
         tracing::warn!("cannot RPC probe peer with invalid origin {origin}");
@@ -372,12 +476,18 @@ fn maybe_probe_remote_rpc(
 fn print_start(
     state: &FolderState,
     endpoint: &Endpoint,
-    ticket: &Ticket,
+    topic_id: TopicId,
+    bootstrap: &[PublicKey],
     poll: bool,
     interval_ms: u64,
 ) {
     tracing::info!("node {}", endpoint.id());
-    tracing::info!("ticket {}", format_ticket(ticket.topic, endpoint.id()));
+    tracing::info!("topic {}", hex(*topic_id.as_bytes()));
+    tracing::info!(
+        "invite command: tngl --folder {} --invite",
+        state.root().display()
+    );
+    tracing::info!("known peers {}", bootstrap.len());
     tracing::info!("watching {}", state.root().display());
     if poll {
         tracing::info!("mode poll interval={}ms", interval_ms.max(50));
@@ -443,7 +553,37 @@ fn summarize_message(message: &GossipMessage) -> String {
             "filesystem-changed origin={origin} lamport={lamport} changes={}",
             changes.len()
         ),
+        GossipMessage::Peers { origin, members } => {
+            format!("peers origin={origin} members={}", members.len())
+        }
     }
+}
+
+fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
+    let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
+    let node_id = secret_key.public();
+    let peers_path = state_dir.join(PEERS_FILE);
+    let _group = GroupState::load_or_init(peers_path, node_id)?;
+    let secret = group::generate_secret()?;
+    let expires_at = group::now_ms()? + expire_secs.saturating_mul(1000);
+    group::add_invite(&state_dir.join(INVITES_FILE), &secret, expires_at)?;
+    println!("{node_id}:{secret}");
+    tracing::info!("invite expires in {}s", expire_secs);
+    Ok(())
+}
+
+async fn join_group(endpoint: &Endpoint, peers_path: &Path, ticket: &str) -> io::Result<()> {
+    let ticket = parse_join_ticket(ticket)?;
+    let rpc_client = rpc::RpcClient::new(endpoint.clone());
+    let (topic_id, members) = rpc_client
+        .join_group(ticket.issuer, ticket.secret, endpoint.id())
+        .await?;
+    let topic_id = topic_id
+        .parse()
+        .map_err(|err| io::Error::other(format!("invalid topic id from join response: {err}")))?;
+    GroupState::replace(peers_path, topic_id, members)?;
+    tracing::info!("joined group via {}", ticket.issuer);
+    Ok(())
 }
 
 fn load_or_create_secret_key(path: &Path) -> io::Result<SecretKey> {
@@ -502,32 +642,20 @@ fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
         })
 }
 
-fn new_topic_id() -> io::Result<TopicId> {
-    let mut bytes = [0_u8; 32];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(TopicId::from_bytes(bytes))
-}
-
-fn parse_ticket(value: &str) -> io::Result<Ticket> {
-    let (topic, peers) = value
+fn parse_join_ticket(value: &str) -> io::Result<JoinTicket> {
+    let (issuer, secret) = value
         .split_once(':')
-        .map_or((value, ""), |(topic, peers)| (topic, peers));
-    let topic = topic
+        .ok_or_else(|| io::Error::other("invalid ticket: expected <node_id>:<secret>"))?;
+    let issuer = issuer
         .parse()
-        .map_err(|err| io::Error::other(format!("invalid topic id in ticket: {err}")))?;
-    let bootstrap = peers
-        .split(',')
-        .filter(|peer| !peer.is_empty())
-        .map(|peer| {
-            peer.parse()
-                .map_err(|err| io::Error::other(format!("invalid peer id in ticket: {err}")))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    Ok(Ticket { topic, bootstrap })
-}
-
-fn format_ticket(topic: TopicId, local_id: PublicKey) -> String {
-    format!("{}:{}", hex(*topic.as_bytes()), local_id)
+        .map_err(|err| io::Error::other(format!("invalid node id in ticket: {err}")))?;
+    if secret.is_empty() {
+        return Err(io::Error::other("invalid ticket: empty secret"));
+    }
+    Ok(JoinTicket {
+        issuer,
+        secret: secret.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -535,11 +663,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ticket_roundtrips_topic_without_bootstrap() {
-        let topic = new_topic_id().unwrap();
-        let ticket = parse_ticket(&hex(*topic.as_bytes())).unwrap();
-        assert_eq!(ticket.topic, topic);
-        assert!(ticket.bootstrap.is_empty());
+    fn join_ticket_parses_node_and_secret() {
+        let issuer = SecretKey::from_bytes(&[7; 32]).public();
+        let ticket = parse_join_ticket(&format!("{issuer}:secret")).unwrap();
+        assert_eq!(ticket.issuer, issuer);
+        assert_eq!(ticket.secret, "secret");
     }
 
     #[test]
