@@ -7,7 +7,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, PublicKey};
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock, mpsc};
@@ -132,7 +132,7 @@ impl RpcClient {
         peer: PublicKey,
         content_hash: [u8; 32],
         expected_size: u64,
-        dest: &std::path::Path,
+        dest: &Path,
     ) -> io::Result<()> {
         let request_id = next_request_id();
         let request = RequestMessage::GetObject {
@@ -348,12 +348,27 @@ async fn handle_get_object(
     }
 }
 
+async fn check_member(
+    group: &Arc<RwLock<GroupState>>,
+    peer: PublicKey,
+    request_id: u64,
+) -> Result<(), ResponseMessage> {
+    if group.read().await.is_active_member(&peer) {
+        Ok(())
+    } else {
+        Err(ResponseMessage::Error {
+            request_id,
+            message: "peer is not a group member".to_string(),
+        })
+    }
+}
+
 async fn handle_request(
     request: RequestMessage,
     peer: PublicKey,
     state: &Arc<RwLock<FolderState>>,
     group: &Arc<RwLock<GroupState>>,
-    invites_path: &PathBuf,
+    invites_path: &Path,
     events: &mpsc::UnboundedSender<RpcEvent>,
 ) -> ResponseMessage {
     match request {
@@ -397,12 +412,7 @@ async fn handle_request(
             }
         }
         RequestMessage::GetRoot { request_id } => {
-            if !group.read().await.is_active_member(&peer) {
-                return ResponseMessage::Error {
-                    request_id,
-                    message: "peer is not a group member".to_string(),
-                };
-            }
+            if let Err(e) = check_member(group, peer, request_id).await { return e; }
             let state = state.read().await;
             ResponseMessage::Root {
                 request_id,
@@ -412,12 +422,7 @@ async fn handle_request(
             }
         }
         RequestMessage::GetNode { request_id, prefix } => {
-            if !group.read().await.is_active_member(&peer) {
-                return ResponseMessage::Error {
-                    request_id,
-                    message: "peer is not a group member".to_string(),
-                };
-            }
+            if let Err(e) = check_member(group, peer, request_id).await { return e; }
             let state = state.read().await;
             ResponseMessage::Node {
                 request_id,
@@ -425,12 +430,7 @@ async fn handle_request(
             }
         }
         RequestMessage::GetEntry { request_id, path } => {
-            if !group.read().await.is_active_member(&peer) {
-                return ResponseMessage::Error {
-                    request_id,
-                    message: "peer is not a group member".to_string(),
-                };
-            }
+            if let Err(e) = check_member(group, peer, request_id).await { return e; }
             let state = state.read().await;
             ResponseMessage::Entry {
                 request_id,
@@ -474,7 +474,7 @@ async fn get_object_to_file_on_connection(
     request: &RequestMessage,
     expected_hash: [u8; 32],
     expected_size: u64,
-    dest: &std::path::Path,
+    dest: &Path,
 ) -> io::Result<()> {
     let (mut send, mut recv) = connection
         .open_bi()
@@ -530,7 +530,7 @@ async fn stream_to_file(
     recv: &mut iroh::endpoint::RecvStream,
     size: u64,
     expected_hash: [u8; 32],
-    dest: &std::path::Path,
+    dest: &Path,
 ) -> io::Result<()> {
     let mut file = tokio::fs::File::create(dest).await?;
     let mut hasher = blake3::Hasher::new();

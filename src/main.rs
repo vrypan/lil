@@ -43,11 +43,7 @@ struct Cli {
     )]
     expire_secs: u64,
 
-    #[arg(
-        long,
-        value_name = "TICKET",
-        help = "Join a group using <node_id>:<secret>"
-    )]
+    #[arg(long, value_name = "TICKET", help = "Join a group using a base62 ticket")]
     ticket: Option<String>,
 
     #[arg(

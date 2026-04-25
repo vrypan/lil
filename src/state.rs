@@ -251,16 +251,7 @@ impl FolderState {
 
         for (path, live_entry) in live {
             seen.insert(path.clone());
-            match self.entries.get(&path) {
-                Some(old) if same_observed_state(old, &live_entry) => {}
-                old => {
-                    let old = old.cloned();
-                    let mut new = live_entry;
-                    new.version = self.next_version();
-                    self.entries.insert(path.clone(), new.clone());
-                    changes.push(Change { path, old, new });
-                }
-            }
+            self.update_entry(&path, live_entry, &mut changes);
         }
 
         let old_paths: Vec<String> = self.entries.keys().cloned().collect();
@@ -268,28 +259,16 @@ impl FolderState {
             if seen.contains(&path) {
                 continue;
             }
-
             let Some(old) = self.entries.get(&path).cloned() else {
                 continue;
             };
             if old.kind == EntryKind::Tombstone {
                 continue;
             }
-
-            let new = Entry {
-                path: path.clone(),
-                kind: EntryKind::Tombstone,
-                content_hash: None,
-                size: 0,
-                mode: old.mode,
-                version: self.next_version(),
-            };
+            let version = self.next_version();
+            let new = tombstone_entry(&path, &old, version);
             self.entries.insert(path.clone(), new.clone());
-            changes.push(Change {
-                path,
-                old: Some(old),
-                new,
-            });
+            changes.push(Change { path, old: Some(old), new });
         }
 
         self.tree = derive_tree(&self.entries);
@@ -309,10 +288,7 @@ impl FolderState {
             })
             .collect();
 
-        if canonical_paths
-            .iter()
-            .any(|p| p == &self.root.join(IGNORE_FILE_NAME))
-        {
+        if canonical_paths.iter().any(|p| p == &self.root.join(IGNORE_FILE_NAME)) {
             return self.rescan();
         }
 
@@ -324,108 +300,7 @@ impl FolderState {
                 Ok(r) if !r.is_empty() => r,
                 _ => continue,
             };
-
-            if should_ignore(&relative, &ignore_patterns) {
-                if let Some(old) = self.entries.get(&relative).cloned() {
-                    if old.kind != EntryKind::Tombstone {
-                        let new = Entry {
-                            path: relative.clone(),
-                            kind: EntryKind::Tombstone,
-                            content_hash: None,
-                            size: 0,
-                            mode: old.mode,
-                            version: self.next_version(),
-                        };
-                        self.entries.insert(relative.clone(), new.clone());
-                        changes.push(Change { path: relative, old: Some(old), new });
-                    }
-                }
-                continue;
-            }
-
-            match fs::symlink_metadata(&abs_path) {
-                Ok(metadata) if metadata.is_file() => {
-                    let live = Entry {
-                        path: relative.clone(),
-                        kind: EntryKind::File,
-                        content_hash: Some(hash_file(&abs_path)?),
-                        size: metadata.len(),
-                        mode: mode(&metadata),
-                        version: placeholder_version(),
-                    };
-                    match self.entries.get(&relative) {
-                        Some(old) if same_observed_state(old, &live) => {}
-                        old => {
-                            let old = old.cloned();
-                            let mut new = live;
-                            new.version = self.next_version();
-                            self.entries.insert(relative.clone(), new.clone());
-                            changes.push(Change { path: relative, old, new });
-                        }
-                    }
-                }
-                Ok(metadata) if metadata.is_dir() => {
-                    let live = Entry {
-                        path: relative.clone(),
-                        kind: EntryKind::Dir,
-                        content_hash: None,
-                        size: 0,
-                        mode: mode(&metadata),
-                        version: placeholder_version(),
-                    };
-                    match self.entries.get(&relative) {
-                        Some(old) if same_observed_state(old, &live) => {}
-                        old => {
-                            let old = old.cloned();
-                            let mut new = live;
-                            new.version = self.next_version();
-                            self.entries.insert(relative.clone(), new.clone());
-                            changes.push(Change { path: relative.clone(), old, new });
-                        }
-                    }
-                    let mut dir_entries = BTreeMap::new();
-                    scan_dir(&self.root, &abs_path, &ignore_patterns, &mut dir_entries)?;
-                    for (path, live) in dir_entries {
-                        match self.entries.get(&path) {
-                            Some(old) if same_observed_state(old, &live) => {}
-                            old => {
-                                let old = old.cloned();
-                                let mut new = live;
-                                new.version = self.next_version();
-                                self.entries.insert(path.clone(), new.clone());
-                                changes.push(Change { path, old, new });
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                    let prefix = format!("{relative}/");
-                    let to_tombstone: Vec<String> = self
-                        .entries
-                        .keys()
-                        .filter(|p| **p == relative || p.starts_with(&prefix))
-                        .cloned()
-                        .collect();
-                    for path in to_tombstone {
-                        let old = self.entries.get(&path).cloned().unwrap();
-                        if old.kind == EntryKind::Tombstone {
-                            continue;
-                        }
-                        let new = Entry {
-                            path: path.clone(),
-                            kind: EntryKind::Tombstone,
-                            content_hash: None,
-                            size: 0,
-                            mode: old.mode,
-                            version: self.next_version(),
-                        };
-                        self.entries.insert(path.clone(), new.clone());
-                        changes.push(Change { path, old: Some(old), new });
-                    }
-                }
-                Err(err) => return Err(err),
-            }
+            self.apply_one_path(&abs_path, &relative, &ignore_patterns, &mut changes)?;
         }
 
         if !changes.is_empty() {
@@ -437,6 +312,93 @@ impl FolderState {
         }
 
         Ok(changes)
+    }
+
+    fn apply_one_path(
+        &mut self,
+        abs_path: &Path,
+        relative: &str,
+        ignore_patterns: &[IgnorePattern],
+        changes: &mut Vec<Change>,
+    ) -> io::Result<()> {
+        if should_ignore(relative, ignore_patterns) {
+            if let Some(old) = self.entries.get(relative).cloned() {
+                if old.kind != EntryKind::Tombstone {
+                    let version = self.next_version();
+                    let new = tombstone_entry(relative, &old, version);
+                    self.entries.insert(relative.to_string(), new.clone());
+                    changes.push(Change { path: relative.to_string(), old: Some(old), new });
+                }
+            }
+            return Ok(());
+        }
+
+        match fs::symlink_metadata(abs_path) {
+            Ok(metadata) if metadata.is_file() => {
+                let live = Entry {
+                    path: relative.to_string(),
+                    kind: EntryKind::File,
+                    content_hash: Some(hash_file(abs_path)?),
+                    size: metadata.len(),
+                    mode: mode(&metadata),
+                    version: placeholder_version(),
+                };
+                self.update_entry(relative, live, changes);
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                let live = Entry {
+                    path: relative.to_string(),
+                    kind: EntryKind::Dir,
+                    content_hash: None,
+                    size: 0,
+                    mode: mode(&metadata),
+                    version: placeholder_version(),
+                };
+                self.update_entry(relative, live, changes);
+                let mut dir_entries = BTreeMap::new();
+                scan_dir(&self.root, abs_path, ignore_patterns, &mut dir_entries)?;
+                for (path, live) in dir_entries {
+                    self.update_entry(&path, live, changes);
+                }
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                self.tombstone_descendants(relative, changes);
+            }
+            Err(err) => return Err(err),
+        }
+        Ok(())
+    }
+
+    fn update_entry(&mut self, path: &str, live: Entry, changes: &mut Vec<Change>) {
+        let existing = self.entries.get(path).cloned();
+        if existing.as_ref().map_or(false, |o| same_observed_state(o, &live)) {
+            return;
+        }
+        let mut new = live;
+        new.version = self.next_version();
+        self.entries.insert(path.to_string(), new.clone());
+        changes.push(Change { path: path.to_string(), old: existing, new });
+    }
+
+    fn tombstone_descendants(&mut self, relative: &str, changes: &mut Vec<Change>) {
+        let prefix = format!("{relative}/");
+        let to_tombstone: Vec<String> = self
+            .entries
+            .keys()
+            .filter(|p| **p == relative || p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for path in to_tombstone {
+            let old = self.entries.get(&path).cloned().unwrap();
+            if old.kind == EntryKind::Tombstone {
+                continue;
+            }
+            let version = self.next_version();
+            let new = tombstone_entry(&path, &old, version);
+            self.entries.insert(path.clone(), new.clone());
+            changes.push(Change { path, old: Some(old), new });
+        }
     }
 
     fn next_version(&mut self) -> Version {
@@ -738,6 +700,17 @@ fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
         }
         b'?' => !text.is_empty() && text[0] != b'/' && glob_match_bytes(&pattern[1..], &text[1..]),
         ch => !text.is_empty() && ch == text[0] && glob_match_bytes(&pattern[1..], &text[1..]),
+    }
+}
+
+fn tombstone_entry(path: &str, old: &Entry, version: Version) -> Entry {
+    Entry {
+        path: path.to_string(),
+        kind: EntryKind::Tombstone,
+        content_hash: None,
+        size: 0,
+        mode: old.mode,
+        version,
     }
 }
 
