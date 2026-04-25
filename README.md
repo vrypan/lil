@@ -52,7 +52,7 @@ State is stored inside the synced folder under:
 
 This contains:
 
-- `iroh.key`: node identity key
+- `private.key`: node identity key
 - `peers.json`: known peers
 - `pending_invites.json`: invite tokens
 - `daemon.cache`: startup cache

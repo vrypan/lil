@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+const KEY_FILE: &str = "private.key";
+
 #[derive(Parser, Debug)]
 #[command(name = "tngl", about = "Monitor a folder and gossip tngl tree changes")]
 struct Cli {
@@ -74,7 +76,7 @@ async fn run() -> io::Result<()> {
     let state_dir = cli.folder.join(".tngl");
     fs::create_dir_all(&state_dir)?;
 
-    let secret_key = load_or_create_secret_key(&state_dir.join("iroh.key"))?;
+    let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
     let endpoint = Endpoint::builder()
         .alpns(vec![GOSSIP_ALPN.to_vec()])
         .secret_key(secret_key)
@@ -390,5 +392,17 @@ mod tests {
         let ticket = parse_ticket(&hex(*topic.as_bytes())).unwrap();
         assert_eq!(ticket.topic, topic);
         assert!(ticket.bootstrap.is_empty());
+    }
+
+    #[test]
+    fn secret_key_is_reused_from_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join(KEY_FILE);
+
+        let first = load_or_create_secret_key(&key_path).unwrap();
+        let second = load_or_create_secret_key(&key_path).unwrap();
+
+        assert_eq!(first.public(), second.public());
+        assert_eq!(fs::read(key_path).unwrap().len(), 32);
     }
 }
