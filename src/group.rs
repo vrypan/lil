@@ -213,10 +213,10 @@ pub fn consume_invite(path: &Path, secret: &str) -> io::Result<bool> {
     Ok(found)
 }
 
-pub fn generate_secret() -> io::Result<String> {
+pub fn generate_secret() -> io::Result<[u8; 32]> {
     let mut bytes = [0u8; 32];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(hex(bytes))
+    Ok(bytes)
 }
 
 pub fn now_ms() -> io::Result<u64> {

@@ -569,10 +569,11 @@ fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
     let node_id = secret_key.public();
     let peers_path = state_dir.join(PEERS_FILE);
     let _group = GroupState::load_or_init(peers_path, node_id)?;
-    let secret = group::generate_secret()?;
+    let secret_bytes = group::generate_secret()?;
+    let secret_hex = hex(secret_bytes);
     let expires_at = group::now_ms()? + expire_secs.saturating_mul(1000);
-    group::add_invite(&state_dir.join(INVITES_FILE), &secret, expires_at)?;
-    println!("{node_id}:{secret}");
+    group::add_invite(&state_dir.join(INVITES_FILE), &secret_hex, expires_at)?;
+    println!("{}", encode_ticket(node_id, &secret_bytes));
     tracing::info!("invite expires in {}s", expire_secs);
     Ok(())
 }
@@ -648,19 +649,86 @@ fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
 }
 
 fn parse_join_ticket(value: &str) -> io::Result<JoinTicket> {
-    let (issuer, secret) = value
-        .split_once(':')
-        .ok_or_else(|| io::Error::other("invalid ticket: expected <node_id>:<secret>"))?;
-    let issuer = issuer
-        .parse()
+    let bytes = ticket_base62_decode(value)?;
+    let issuer = PublicKey::from_bytes(&bytes[..32].try_into().unwrap())
         .map_err(|err| io::Error::other(format!("invalid node id in ticket: {err}")))?;
-    if secret.is_empty() {
-        return Err(io::Error::other("invalid ticket: empty secret"));
+    let secret_arr: [u8; 32] = bytes[32..].try_into().unwrap();
+    let secret = hex(secret_arr);
+    Ok(JoinTicket { issuer, secret })
+}
+
+fn encode_ticket(node_id: PublicKey, secret_bytes: &[u8; 32]) -> String {
+    let mut combined = [0u8; 64];
+    combined[..32].copy_from_slice(node_id.as_bytes());
+    combined[32..].copy_from_slice(secret_bytes);
+    ticket_base62_encode(&combined)
+}
+
+const BASE62_ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const TICKET_CHARS: usize = 86;
+
+fn ticket_base62_encode(bytes: &[u8; 64]) -> String {
+    let mut n = *bytes;
+    let mut digits = Vec::with_capacity(TICKET_CHARS);
+    loop {
+        let rem = b62_divmod(&mut n);
+        digits.push(BASE62_ALPHABET[rem as usize]);
+        if n.iter().all(|&b| b == 0) {
+            break;
+        }
     }
-    Ok(JoinTicket {
-        issuer,
-        secret: secret.to_string(),
-    })
+    while digits.len() < TICKET_CHARS {
+        digits.push(BASE62_ALPHABET[0]);
+    }
+    digits.reverse();
+    String::from_utf8(digits).unwrap()
+}
+
+fn ticket_base62_decode(s: &str) -> io::Result<[u8; 64]> {
+    if s.len() != TICKET_CHARS {
+        return Err(io::Error::other(format!(
+            "invalid ticket: expected {} chars, got {}",
+            TICKET_CHARS,
+            s.len()
+        )));
+    }
+    let mut result = [0u8; 64];
+    for &ch in s.as_bytes() {
+        let digit = b62_char_to_digit(ch)?;
+        b62_mul_add(&mut result, digit);
+    }
+    Ok(result)
+}
+
+fn b62_divmod(bytes: &mut [u8]) -> u8 {
+    let mut rem = 0u32;
+    for b in bytes.iter_mut() {
+        let val = rem * 256 + *b as u32;
+        *b = (val / 62) as u8;
+        rem = val % 62;
+    }
+    rem as u8
+}
+
+fn b62_mul_add(bytes: &mut [u8], digit: u8) {
+    let mut carry = digit as u32;
+    for b in bytes.iter_mut().rev() {
+        let val = *b as u32 * 62 + carry;
+        *b = (val & 0xFF) as u8;
+        carry = val >> 8;
+    }
+}
+
+fn b62_char_to_digit(ch: u8) -> io::Result<u8> {
+    match ch {
+        b'0'..=b'9' => Ok(ch - b'0'),
+        b'A'..=b'Z' => Ok(ch - b'A' + 10),
+        b'a'..=b'z' => Ok(ch - b'a' + 36),
+        _ => Err(io::Error::other(format!(
+            "invalid ticket char: {}",
+            ch as char
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -668,11 +736,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn join_ticket_parses_node_and_secret() {
+    fn join_ticket_roundtrips() {
         let issuer = SecretKey::from_bytes(&[7; 32]).public();
-        let ticket = parse_join_ticket(&format!("{issuer}:secret")).unwrap();
-        assert_eq!(ticket.issuer, issuer);
-        assert_eq!(ticket.secret, "secret");
+        let secret_bytes = [0xABu8; 32];
+        let ticket_str = encode_ticket(issuer, &secret_bytes);
+        assert_eq!(ticket_str.len(), TICKET_CHARS);
+        let parsed = parse_join_ticket(&ticket_str).unwrap();
+        assert_eq!(parsed.issuer, issuer);
+        assert_eq!(parsed.secret, hex(secret_bytes));
     }
 
     #[test]
