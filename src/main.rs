@@ -12,12 +12,13 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, PublicKey, SecretKey};
 use iroh_gossip::api::{ApiError, Event as GossipEvent, GossipSender};
 use iroh_gossip::{ALPN as GOSSIP_ALPN, Gossip, TopicId};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 const KEY_FILE: &str = "private.key";
 
@@ -111,6 +112,8 @@ async fn run() -> io::Result<()> {
     let _watcher = watcher::spawn(watch_root, cli.interval_ms, cli.poll, fs_tx)?;
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
+    let rpc_client = rpc::RpcClient::new(endpoint.clone());
+    let probed_remote_roots = Arc::new(Mutex::new(HashSet::new()));
     let _router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .accept(rpc::ALPN, rpc::FolderRpc::new(Arc::clone(&state)))
@@ -158,7 +161,13 @@ async fn run() -> io::Result<()> {
                 let Some(event) = event else {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gossip stream closed"));
                 };
-                handle_gossip_event(event, &endpoint, Arc::clone(&state), &local_origin).await?;
+                handle_gossip_event(
+                    event,
+                    rpc_client.clone(),
+                    Arc::clone(&state),
+                    Arc::clone(&probed_remote_roots),
+                    &local_origin,
+                ).await?;
             }
             _ = announce_interval.tick() => {
                 let snapshot = {
@@ -229,8 +238,9 @@ async fn publish(sender: &GossipSender, message: GossipMessage) {
 
 async fn handle_gossip_event(
     event: Result<GossipEvent, ApiError>,
-    endpoint: &Endpoint,
+    rpc_client: rpc::RpcClient,
     state: Arc<RwLock<FolderState>>,
+    probed_remote_roots: Arc<Mutex<HashSet<String>>>,
     local_origin: &str,
 ) -> io::Result<()> {
     match event {
@@ -247,7 +257,7 @@ async fn handle_gossip_event(
                 StateSnapshot::from_state(&state)
             };
             print_remote_message(&message, &local);
-            maybe_probe_remote_rpc(endpoint.clone(), message, state);
+            maybe_probe_remote_rpc(rpc_client, message, state, probed_remote_roots);
         }
         Ok(GossipEvent::NeighborUp(endpoint_id)) => {
             tracing::info!("gossip neighbor up {endpoint_id}");
@@ -316,9 +326,10 @@ fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
 }
 
 fn maybe_probe_remote_rpc(
-    endpoint: Endpoint,
+    rpc_client: rpc::RpcClient,
     message: GossipMessage,
     state: Arc<RwLock<FolderState>>,
+    probed_remote_roots: Arc<Mutex<HashSet<String>>>,
 ) {
     let (origin, remote_state_root, remote_live_root) = match message {
         GossipMessage::SyncState {
@@ -348,7 +359,21 @@ fn maybe_probe_remote_rpc(
             return;
         }
 
-        match rpc::get_root(&endpoint, peer).await {
+        let probe_key = format!(
+            "{}:{}:{}",
+            peer,
+            hex(remote_state_root),
+            hex(remote_live_root)
+        );
+        {
+            let mut probed = probed_remote_roots.lock().await;
+            if !probed.insert(probe_key) {
+                tracing::debug!("rpc probe peer={} skipped for already-seen roots", peer);
+                return;
+            }
+        }
+
+        match rpc_client.get_root(peer).await {
             Ok((state_root, live_root, lamport)) => {
                 tracing::info!(
                     "rpc GetRoot peer={} lamport={} state_root={} live_root={}",
@@ -364,7 +389,7 @@ fn maybe_probe_remote_rpc(
             }
         }
 
-        match rpc::get_node(&endpoint, peer, "").await {
+        match rpc_client.get_node(peer, "").await {
             Ok(Some(node)) => tracing::info!(
                 "rpc GetNode peer={} prefix={} entries={} children={} hash={}",
                 peer,

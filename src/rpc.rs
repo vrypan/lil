@@ -5,10 +5,11 @@ use crate::state::{FolderState, TreeNode, hex};
 use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, PublicKey};
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 pub const ALPN: &[u8] = b"tngl/rpc/1";
 
@@ -26,6 +27,103 @@ pub struct FolderRpc {
 impl FolderRpc {
     pub fn new(state: Arc<RwLock<FolderState>>) -> Self {
         Self { state }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RpcClient {
+    endpoint: Endpoint,
+    connections: Arc<Mutex<HashMap<PublicKey, Connection>>>,
+}
+
+impl RpcClient {
+    pub fn new(endpoint: Endpoint) -> Self {
+        Self {
+            endpoint,
+            connections: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn get_root(&self, peer: PublicKey) -> io::Result<([u8; 32], [u8; 32], u64)> {
+        let request_id = next_request_id();
+        match self
+            .round_trip(peer, RequestMessage::GetRoot { request_id })
+            .await?
+        {
+            ResponseMessage::Root {
+                request_id: actual,
+                state_root,
+                live_root,
+                lamport,
+            } if actual == request_id => Ok((state_root, live_root, lamport)),
+            ResponseMessage::Error {
+                request_id: actual,
+                message,
+            } if actual == request_id => Err(io::Error::other(message)),
+            response => Err(io::Error::other(format!(
+                "unexpected GetRoot response from {peer}: {response:?}"
+            ))),
+        }
+    }
+
+    pub async fn get_node(&self, peer: PublicKey, prefix: &str) -> io::Result<Option<TreeNode>> {
+        let request_id = next_request_id();
+        let request = RequestMessage::GetNode {
+            request_id,
+            prefix: prefix.to_string(),
+        };
+        match self.round_trip(peer, request).await? {
+            ResponseMessage::Node {
+                request_id: actual,
+                node,
+            } if actual == request_id => Ok(node),
+            ResponseMessage::Error {
+                request_id: actual,
+                message,
+            } if actual == request_id => Err(io::Error::other(message)),
+            response => Err(io::Error::other(format!(
+                "unexpected GetNode response from {peer}: {response:?}"
+            ))),
+        }
+    }
+
+    async fn round_trip(
+        &self,
+        peer: PublicKey,
+        request: RequestMessage,
+    ) -> io::Result<ResponseMessage> {
+        let connection = self.connection(peer).await?;
+        match round_trip_on_connection(&connection, peer, &request).await {
+            Ok(response) => Ok(response),
+            Err(first_err) => {
+                self.drop_connection(peer).await;
+                tracing::debug!(target: "tngl::rpc", %peer, "retrying RPC after connection error: {first_err}");
+                let connection = self.connection(peer).await?;
+                round_trip_on_connection(&connection, peer, &request).await
+            }
+        }
+    }
+
+    async fn connection(&self, peer: PublicKey) -> io::Result<Connection> {
+        let mut connections = self.connections.lock().await;
+        if let Some(connection) = connections.get(&peer) {
+            if connection.close_reason().is_none() {
+                return Ok(connection.clone());
+            }
+            connections.remove(&peer);
+        }
+
+        let connection = self
+            .endpoint
+            .connect(peer, ALPN)
+            .await
+            .map_err(|err| io::Error::other(format!("connect to {peer}: {err}")))?;
+        connections.insert(peer, connection.clone());
+        Ok(connection)
+    }
+
+    async fn drop_connection(&self, peer: PublicKey) {
+        self.connections.lock().await.remove(&peer);
     }
 }
 
@@ -126,62 +224,11 @@ async fn handle_request(
     }
 }
 
-pub async fn get_root(
-    endpoint: &Endpoint,
+async fn round_trip_on_connection(
+    connection: &Connection,
     peer: PublicKey,
-) -> io::Result<([u8; 32], [u8; 32], u64)> {
-    let request_id = next_request_id();
-    match round_trip(endpoint, peer, RequestMessage::GetRoot { request_id }).await? {
-        ResponseMessage::Root {
-            request_id: actual,
-            state_root,
-            live_root,
-            lamport,
-        } if actual == request_id => Ok((state_root, live_root, lamport)),
-        ResponseMessage::Error {
-            request_id: actual,
-            message,
-        } if actual == request_id => Err(io::Error::other(message)),
-        response => Err(io::Error::other(format!(
-            "unexpected GetRoot response from {peer}: {response:?}"
-        ))),
-    }
-}
-
-pub async fn get_node(
-    endpoint: &Endpoint,
-    peer: PublicKey,
-    prefix: &str,
-) -> io::Result<Option<TreeNode>> {
-    let request_id = next_request_id();
-    let request = RequestMessage::GetNode {
-        request_id,
-        prefix: prefix.to_string(),
-    };
-    match round_trip(endpoint, peer, request).await? {
-        ResponseMessage::Node {
-            request_id: actual,
-            node,
-        } if actual == request_id => Ok(node),
-        ResponseMessage::Error {
-            request_id: actual,
-            message,
-        } if actual == request_id => Err(io::Error::other(message)),
-        response => Err(io::Error::other(format!(
-            "unexpected GetNode response from {peer}: {response:?}"
-        ))),
-    }
-}
-
-async fn round_trip(
-    endpoint: &Endpoint,
-    peer: PublicKey,
-    request: RequestMessage,
+    request: &RequestMessage,
 ) -> io::Result<ResponseMessage> {
-    let connection = endpoint
-        .connect(peer, ALPN)
-        .await
-        .map_err(|err| io::Error::other(format!("connect to {peer}: {err}")))?;
     let (mut send, mut recv) = connection
         .open_bi()
         .await
