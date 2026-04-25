@@ -1,7 +1,7 @@
 use crate::protocol::{
     RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, write_frame,
 };
-use crate::state::{FolderState, TreeNode, hex};
+use crate::state::{Entry, FolderState, TreeNode, hex};
 use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, PublicKey};
@@ -83,6 +83,48 @@ impl RpcClient {
             } if actual == request_id => Err(io::Error::other(message)),
             response => Err(io::Error::other(format!(
                 "unexpected GetNode response from {peer}: {response:?}"
+            ))),
+        }
+    }
+
+    pub async fn get_entry(&self, peer: PublicKey, path: &str) -> io::Result<Option<Entry>> {
+        let request_id = next_request_id();
+        let request = RequestMessage::GetEntry {
+            request_id,
+            path: path.to_string(),
+        };
+        match self.round_trip(peer, request).await? {
+            ResponseMessage::Entry {
+                request_id: actual,
+                entry,
+            } if actual == request_id => Ok(entry),
+            ResponseMessage::Error {
+                request_id: actual,
+                message,
+            } if actual == request_id => Err(io::Error::other(message)),
+            response => Err(io::Error::other(format!(
+                "unexpected GetEntry response from {peer}: {response:?}"
+            ))),
+        }
+    }
+
+    pub async fn get_object(&self, peer: PublicKey, content_hash: [u8; 32]) -> io::Result<Vec<u8>> {
+        let request_id = next_request_id();
+        let request = RequestMessage::GetObject {
+            request_id,
+            content_hash,
+        };
+        match self.round_trip(peer, request).await? {
+            ResponseMessage::Object {
+                request_id: actual,
+                bytes,
+            } if actual == request_id => Ok(bytes),
+            ResponseMessage::Error {
+                request_id: actual,
+                message,
+            } if actual == request_id => Err(io::Error::other(message)),
+            response => Err(io::Error::other(format!(
+                "unexpected GetObject response from {peer}: {response:?}"
             ))),
         }
     }

@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const STATE_DIR: &str = ".tngl";
@@ -167,6 +167,82 @@ impl FolderState {
         })
     }
 
+    pub fn should_accept_remote(&self, remote: &Entry) -> bool {
+        self.entries
+            .get(&remote.path)
+            .map(|local| remote.version > local.version)
+            .unwrap_or(true)
+    }
+
+    pub fn apply_remote_entry(
+        &mut self,
+        remote: Entry,
+        object_bytes: Option<&[u8]>,
+    ) -> io::Result<Option<Change>> {
+        if !self.should_accept_remote(&remote) {
+            return Ok(None);
+        }
+
+        match remote.kind {
+            EntryKind::File => {
+                let bytes = object_bytes.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("missing object bytes for {}", remote.path),
+                    )
+                })?;
+                verify_object_bytes(&remote, bytes)?;
+                self.write_remote_file(&remote, bytes)?;
+            }
+            EntryKind::Dir => {
+                fs::create_dir_all(self.root.join(&remote.path))?;
+            }
+            EntryKind::Tombstone => {
+                remove_path_if_exists(&self.root.join(&remote.path))?;
+            }
+        }
+
+        self.lamport = self.lamport.max(remote.version.lamport);
+        let old = self.entries.insert(remote.path.clone(), remote.clone());
+        self.tree = derive_tree(&self.entries);
+        self.live_tree = derive_live_tree(&self.entries);
+        Ok(Some(Change {
+            path: remote.path.clone(),
+            old,
+            new: remote,
+        }))
+    }
+
+    fn write_remote_file(&self, remote: &Entry, bytes: &[u8]) -> io::Result<()> {
+        let path = self.root.join(&remote.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let tmp_dir = self.root.join(STATE_DIR);
+        fs::create_dir_all(&tmp_dir)?;
+        let tmp_path = tmp_dir.join(format!(
+            "recv-{}-{}",
+            remote.version.lamport,
+            remote.path.replace('/', "_")
+        ));
+
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp_path, &path)?;
+
+        #[cfg(unix)]
+        if let Some(mode) = remote.mode {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+        }
+
+        Ok(())
+    }
+
     pub fn rescan(&mut self) -> io::Result<Vec<Change>> {
         let live = scan_folder(&self.root)?;
         let mut changes = Vec::new();
@@ -226,6 +302,42 @@ impl FolderState {
             lamport: self.lamport,
             origin: self.origin.clone(),
         }
+    }
+}
+
+fn verify_object_bytes(entry: &Entry, bytes: &[u8]) -> io::Result<()> {
+    if entry.size != bytes.len() as u64 {
+        return Err(io::Error::other(format!(
+            "object size mismatch for {}: expected {}, got {}",
+            entry.path,
+            entry.size,
+            bytes.len()
+        )));
+    }
+    let Some(expected_hash) = entry.content_hash else {
+        return Err(io::Error::other(format!(
+            "file entry {} has no content hash",
+            entry.path
+        )));
+    };
+    let actual_hash = *blake3::hash(bytes).as_bytes();
+    if actual_hash != expected_hash {
+        return Err(io::Error::other(format!(
+            "object hash mismatch for {}: expected {}, got {}",
+            entry.path,
+            hex(expected_hash),
+            hex(actual_hash)
+        )));
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -855,6 +967,58 @@ mod tests {
         assert!(changes.iter().any(|change| change.path == ".notngl"));
         let ignored = state.entries.get("keep.txt").unwrap();
         assert_eq!(ignored.kind, EntryKind::Tombstone);
+    }
+
+    #[test]
+    fn applies_higher_version_remote_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let bytes = b"remote\n";
+        let remote = Entry {
+            path: "remote.txt".to_string(),
+            kind: EntryKind::File,
+            content_hash: Some(*blake3::hash(bytes).as_bytes()),
+            size: bytes.len() as u64,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        let change = state
+            .apply_remote_entry(remote, Some(bytes.as_slice()))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(change.verb(), "file new");
+        assert_eq!(fs::read(tmp.path().join("remote.txt")).unwrap(), bytes);
+        assert_eq!(state.entry("remote.txt").unwrap().version.lamport, 10);
+        assert_eq!(state.lamport(), 10);
+    }
+
+    #[test]
+    fn applies_higher_version_remote_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("gone.txt"), "local").unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let remote = Entry {
+            path: "gone.txt".to_string(),
+            kind: EntryKind::Tombstone,
+            content_hash: None,
+            size: 0,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        let change = state.apply_remote_entry(remote, None).unwrap().unwrap();
+
+        assert_eq!(change.verb(), "delete");
+        assert!(!tmp.path().join("gone.txt").exists());
+        assert_eq!(state.entry("gone.txt").unwrap().kind, EntryKind::Tombstone);
     }
 
     #[test]
