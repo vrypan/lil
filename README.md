@@ -1,137 +1,87 @@
 
 > [!WARNING]
-> `tbgl` is experimental. **There may be bugs that could DELETE or EXPOSE
+> `lil` is experimental. **There may be bugs that could DELETE or EXPOSE
 > your files.**
 
-# tngl
+# lil — a little tool to sync your files
 
-`tngl` (pronounced *"tangle"*) syncs a folder between a small, **trusted** group of nodes. 
+`lil` syncs a folder between a small, **trusted** group of nodes.
 
-It is designed for direct peer-to-peer sync between your own machines or other
-trusted peers. Each node keeps a full local copy of the synced folder. Any node
-in the group can create a ticket that can be used by a new node to join.
+It is designed for peer-to-peer sync between your own machines or
+other trusted peers. Each node keeps a full local copy of the synced folder.
+Any node in the group can create a ticket that allows a new node to join.
 
-`tngl` uses [iroh and iroh-gossip](https://www.iroh.computer) which allows end-t-end encrypted
-connections over QUIC, and will work even if the nodes are behind a firewall: Iroh
-offers relay nodes that facilitate the communication but are unable to see the
-encrypted data passing through them. `tngl` could use private relays in the future, but this
-is beyond the current scope of the project.
+`lil` uses [iroh and iroh-gossip](https://www.iroh.computer) for end-to-end
+encrypted connections over QUIC. Connections work even when nodes are behind
+a firewall — iroh relay servers facilitate the handshake but cannot see the
+encrypted data.
 
 > [!NOTE]
-> See [SECURITY.md](SECURITY.md) for a full threat model and known limitations.
+> See [SECURITY.md](SECURITY.md) for the full threat model and known limitations.
 
 ## Build
-
-Debug build:
-
-```bash
-cargo build
-```
-
-Release build:
 
 ```bash
 cargo build --release
 ```
 
-The binary name is `tngl`.
+The binary is `lil` (`target/release/lil`).
 
 ## Basic Usage
 
-Start a node for a folder:
+Start syncing a folder (creates a new single-node group on first run):
 
 ```bash
-./target/release/tngl --folder /path/to/folder
+lil sync /path/to/folder
 ```
 
-State is stored inside the synced folder under:
+State is stored inside the synced folder under `.lil/`:
 
-```text
-<folder>/.tngl/
-```
+| File | Purpose |
+|---|---|
+| `private.key` | Node identity key |
+| `daemon.lock` | Exclusive process lock |
+| `peers.json` | Known peers and group membership |
+| `invites.json` | Pending invite tokens |
+| `entries.bin` | Persisted entry index (survives restarts) |
+| `lamport` | Persisted Lamport clock |
 
-This contains:
+## Adding a Second Node
 
-- `private.key`: node identity key
-- `daemon.lock`: exclusive process lock
-- `peers.json`: known peers
-- `pending_invites.json`: invite tokens
-- `daemon.cache`: startup cache
-
-## Additional Node Setup
-
-Generate an invite on node A:
+Generate an invite on the first node:
 
 ```bash
-./target/release/tngl --folder /tmp/node-a --invite
+lil invite /path/to/folder
 ```
 
-This prints a ticket of the form:
-
-```text
-<NODE_ID>:<TOKEN>
-```
-
-Join from node B:
+This prints an 86-character base62 ticket. On the second node:
 
 ```bash
-./target/release/tngl --folder /tmp/node-b --join '<NODE_ID>:<TOKEN>'
+lil join /path/to/folder2 <ticket>
 ```
 
-`--join` performs the join handshake, saves the peer list to
-`/tmp/node-b/.tngl/peers.json`, and then starts the daemon normally.
+`join` completes the handshake and then starts the daemon.
 
-## Useful Flags
+## Subcommands
 
-Print the local node ID and exit:
-
-```bash
-./target/release/tngl --folder /tmp/node-a --show-id
+```
+lil sync <folder> [--name <name>] [--poll] [--interval-ms <ms>]
+                  [--announce-interval-secs <secs>]
+lil invite <folder> [--expire-secs <secs>]
+lil join <folder> <ticket> [--name <name>]
+lil peers <folder>
+lil remove <folder> <id-or-name>
 ```
 
-Force a full startup rescan by dropping the cache before startup:
-
-```bash
-./target/release/tngl --folder /tmp/node-a --rescan
-```
-
-Set a custom invite expiration in seconds:
-
-```bash
-./target/release/tngl --folder /tmp/node-a --invite --expire 600
-```
-
-Remove a peer from the membership ledger and broadcast the update:
-
-```bash
-./target/release/tngl --folder /tmp/node-a --remove-peer <NODE_ID>
-```
-
-> [!WARNING]
-> A removed node can still listen to gossip messages exchanged by the rest
-> of the nodes, but it can not read new file contents. This means a removed
-> node may not be able to read new files, but will we aware of filenames
-> and folder activity. `tngl` is designed to be used between **trusted**
-> nodes.
-
-Set how often `SyncState` is broadcast (default 10 seconds). Lower values
-speed up repair at the cost of more gossip traffic:
-
-```bash
-./target/release/tngl --folder /tmp/node-a --sync-state-interval 30
-```
+- `--name` sets a human-readable label for this node, visible to peers.
+- `--poll` uses filesystem polling instead of native OS notifications.
+- `--interval-ms` sets the watcher debounce window (default 500 ms).
+- `--announce-interval-secs` sets how often `SyncState` is broadcast (default 10 s).
+- `--expire-secs` sets invite lifetime (default 3600 s).
 
 ## Ignore Rules
 
-You can ignore paths by creating a file named:
-
-```text
-.notngl
-```
-
-inside the synced folder.
-
-Example:
+Create `.nolil` inside the synced folder to exclude paths:
 
 ```text
 files/
@@ -140,54 +90,38 @@ build/
 !build/keep.txt
 ```
 
-Supported rule features are intentionally gitignore-like:
+Supported syntax (gitignore-like):
 
-- blank lines
-- `#` comments
-- `!` negation
-- `*`, `?`, and `**`
-- leading `/` for root-anchored patterns
-- trailing `/` for directory patterns
+- blank lines and `#` comments are ignored
+- `!` negates a rule
+- `*`, `?`, `**` wildcards
+- leading `/` anchors to the root
+- trailing `/` matches directories only
 
-When `.notngl` changes, `tngl` rescans the folder so newly ignored paths become
-tombstones and newly unignored paths can reappear.
+When `.nolil` changes, `lil` rescans the folder. Newly ignored paths stop
+being tracked locally; they are **not** deleted on remote peers.
 
 ## Notes
 
-- `.tngl/` is always ignored by sync; it also holds temporary files during
-  in-flight transfers (`recv-*`), which are removed on completion or error.
-- Live replication uses gossip announcements plus direct `GetFiles` pulls.
-  File content is streamed over QUIC without buffering the whole file in memory;
-  the blake3 hash is verified before the temp file is moved into place.
-- If a targeted `GetFiles` fetch fails, the node falls back to a full Merkle
-  tree sync (`GetNodes` walk) against the same peer.
-- Repair is also driven by periodic `SyncState` broadcasts (default every
-  10 seconds). Any node with a different root hash initiates a tree sync.
-- Some OS metadata files are ignored automatically: `.DS_Store`, `Thumbs.db`,
-  `Desktop.ini`, `._*`, `.Spotlight-V100`, and `$RECYCLE.BIN`.
-- Empty directories are not tracked as first-class state. If the last file in a
-  directory is deleted, the empty directory is removed on peers.
+- `.lil/` is always excluded from sync. Temporary files for in-flight
+  transfers (`recv-*`) are stored there and removed on completion or error.
+- File content is streamed over QUIC without buffering the whole file in
+  memory; BLAKE3 hash is verified before the temp file is renamed into place.
+- Up to 8 file downloads run in parallel per reconciliation pass.
+- Periodic `SyncState` broadcasts (default every 10 s) drive repair: any node
+  with a different root hash initiates a Merkle tree sync.
+- Tombstones (records of deleted files) are persisted across restarts and
+  garbage-collected once all active peers have confirmed they synced past them.
+- Some OS metadata files are always ignored: `.DS_Store`, `Thumbs.db`,
+  `Desktop.ini`, `._*`, `.Spotlight-V100`, `$RECYCLE.BIN`, `lost+found`.
+- Empty directories are not tracked. If the last file in a directory is
+  deleted, the empty directory is removed on peers.
 
 ## Debugging
 
-Log verbosity is controlled via the `RUST_LOG` environment variable.
-The default level is `info`.
-
-Show all operational events (default):
+Log verbosity is controlled via `RUST_LOG` (default: `info`):
 
 ```bash
-RUST_LOG=info ./target/release/tngl --folder /tmp/node-a
-```
-
-Show gossip and RPC traffic:
-
-```bash
-RUST_LOG=debug ./target/release/tngl --folder /tmp/node-a
-```
-
-Show only gossip or only RPC at debug level, everything else at info:
-
-```bash
-RUST_LOG=info,tngl::gossip=debug ./target/release/tngl --folder /tmp/node-a
-RUST_LOG=info,tngl::rpc=debug   ./target/release/tngl --folder /tmp/node-a
+RUST_LOG=info lil sync /tmp/node-a
+RUST_LOG=debug lil sync /tmp/node-a
 ```

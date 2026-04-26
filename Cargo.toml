@@ -2,10 +2,10 @@
 name = "lilsync"
 version = "0.1.1"
 edition = "2024"
-description = "Mesh sync daemon for folders"
+description = "a little tool to sync your files"
 license = "MIT"
-repository = "https://github.com/vrypan/fmesh"
-homepage = "https://github.com/vrypan/fmesh"
+repository = "https://github.com/vrypan/lilsync"
+homepage = "https://github.com/vrypan/lilsync"
 
 [[bin]]
 name = "lil"
