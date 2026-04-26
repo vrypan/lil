@@ -593,10 +593,8 @@ fn should_ignore(relative: &str, ignore_patterns: &[IgnorePattern]) -> bool {
     }) || matches_ignore_patterns(ignore_patterns, relative)
 }
 
-const LEGACY_STATE_DIRS: &[&str] = &[".tngl"];
-
 fn should_ignore_component(name: &str) -> bool {
-    name == STATE_DIR || LEGACY_STATE_DIRS.contains(&name)
+    name == STATE_DIR
         || IGNORED_FILE_NAMES.contains(&name)
         || IGNORED_FILE_PREFIXES
             .iter()
@@ -1347,9 +1345,9 @@ mod tests {
         fs::write(tmp.path().join("keep.txt"), "keep").unwrap();
         let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
 
-        let notngl = tmp.path().join(".nolil");
-        fs::write(&notngl, "keep.txt\n").unwrap();
-        let changes = state.apply_paths(vec![notngl]).unwrap();
+        let nolil = tmp.path().join(".nolil");
+        fs::write(&nolil, "keep.txt\n").unwrap();
+        let changes = state.apply_paths(vec![nolil]).unwrap();
 
         assert!(changes.iter().any(|c| c.path == ".nolil"));
         // keep.txt is now ignored but stays live in state — no deletion broadcast
