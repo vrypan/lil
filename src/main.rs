@@ -314,19 +314,6 @@ async fn run_sync(
                 };
                 publish_sync_state(&sender, &snapshot, &local_origin).await;
                 publish_peers(&sender, Arc::clone(&group), &local_origin).await;
-                let active = group.read().await.active_peers();
-                if !active.is_empty() {
-                    let join = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        sender.join_peers(active),
-                    )
-                    .await;
-                    match join {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => tracing::warn!("re-join peers failed: {err}"),
-                        Err(_) => tracing::warn!("re-join peers timed out"),
-                    }
-                }
             }
         }
     }
