@@ -9,7 +9,7 @@ mod watcher;
 use crate::group::GroupState;
 use crate::message::{GossipMessage, WireChange};
 use crate::state::{Change, FolderState, hex};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
 use iroh::protocol::Router;
 use iroh::{Endpoint, PublicKey, SecretKey};
@@ -27,53 +27,56 @@ const PEERS_FILE: &str = "peers.json";
 const INVITES_FILE: &str = "invites.json";
 
 #[derive(Parser, Debug)]
-#[command(name = "lil", about = "Monitor a folder and lilsync folder daemon")]
+#[command(name = "lil", about = "lilsync folder sync daemon")]
 struct Cli {
-    #[arg(long, value_name = "PATH", help = "Folder to monitor")]
-    folder: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
 
-    #[arg(long, value_name = "NAME", help = "Human-readable name for this node")]
-    name: Option<String>,
-
-    #[arg(long, help = "Create a one-time group join ticket and exit")]
-    invite: bool,
-
-    #[arg(
-        long,
-        value_name = "SECONDS",
-        default_value = "3600",
-        help = "Ticket lifetime when used with --invite"
-    )]
-    expire_secs: u64,
-
-    #[arg(long, value_name = "TICKET", help = "Join a group using a base62 ticket")]
-    ticket: Option<String>,
-
-    #[arg(
-        long,
-        value_name = "ID_OR_NAME",
-        help = "Remove a peer by node ID or name and exit (restart daemon to broadcast)"
-    )]
-    remove: Option<String>,
-
-    #[arg(
-        long,
-        value_name = "MILLIS",
-        default_value = "500",
-        help = "Debounce delay for filesystem events, or scan interval with --poll"
-    )]
-    interval_ms: u64,
-
-    #[arg(
-        long,
-        value_name = "SECONDS",
-        default_value = "10",
-        help = "How often to publish local root state"
-    )]
-    announce_interval_secs: u64,
-
-    #[arg(long, help = "Use periodic polling instead of filesystem events")]
-    poll: bool,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run the sync daemon for a folder
+    Sync {
+        /// Folder to monitor
+        folder: PathBuf,
+        /// Human-readable name for this node
+        #[arg(long)]
+        name: Option<String>,
+        /// Use periodic polling instead of filesystem events
+        #[arg(long)]
+        poll: bool,
+        /// Debounce delay for filesystem events, or scan interval with --poll
+        #[arg(long, value_name = "MILLIS", default_value = "500")]
+        interval_ms: u64,
+        /// How often to publish local root state
+        #[arg(long, value_name = "SECONDS", default_value = "10")]
+        announce_interval_secs: u64,
+    },
+    /// Create a one-time join ticket and exit
+    Invite {
+        /// Folder whose group to invite into
+        folder: PathBuf,
+        /// Ticket lifetime in seconds
+        #[arg(long, value_name = "SECONDS", default_value = "3600")]
+        expire_secs: u64,
+    },
+    /// Join a group using a ticket
+    Join {
+        /// Folder to sync
+        folder: PathBuf,
+        /// 86-character base62 ticket from `lil invite`
+        ticket: String,
+        /// Human-readable name for this node
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Remove a peer by node ID or name
+    Remove {
+        /// Folder whose group to modify
+        folder: PathBuf,
+        /// Node ID or name to remove
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -100,18 +103,57 @@ async fn main() {
 
 async fn run() -> io::Result<()> {
     let cli = Cli::parse();
-    fs::create_dir_all(&cli.folder)?;
 
-    let state_dir = cli.folder.join(".lil");
+    match cli.command {
+        Command::Invite { folder, expire_secs } => {
+            fs::create_dir_all(&folder)?;
+            let state_dir = folder.join(".lil");
+            fs::create_dir_all(&state_dir)?;
+            return create_invite(&state_dir, expire_secs);
+        }
+        Command::Remove { folder, target } => {
+            fs::create_dir_all(&folder)?;
+            let state_dir = folder.join(".lil");
+            fs::create_dir_all(&state_dir)?;
+            return remove_peer_cmd(&state_dir, &target);
+        }
+        Command::Join { folder, ticket, name } => {
+            fs::create_dir_all(&folder)?;
+            let state_dir = folder.join(".lil");
+            fs::create_dir_all(&state_dir)?;
+            let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
+            let endpoint = Endpoint::builder()
+                .alpns(vec![GOSSIP_ALPN.to_vec(), rpc::ALPN.to_vec()])
+                .secret_key(secret_key)
+                .bind()
+                .await
+                .map_err(io::Error::other)?;
+            let peers_path = state_dir.join(PEERS_FILE);
+            join_group(&endpoint, &peers_path, &ticket, name.clone()).await?;
+            run_sync(folder, name, false, 500, 10).await?;
+        }
+        Command::Sync {
+            folder,
+            name,
+            poll,
+            interval_ms,
+            announce_interval_secs,
+        } => run_sync(folder, name, poll, interval_ms, announce_interval_secs).await?,
+    }
+    Ok(())
+}
+
+async fn run_sync(
+    folder: PathBuf,
+    name: Option<String>,
+    poll: bool,
+    interval_ms: u64,
+    announce_interval_secs: u64,
+) -> io::Result<()> {
+    fs::create_dir_all(&folder)?;
+
+    let state_dir = folder.join(".lil");
     fs::create_dir_all(&state_dir)?;
-
-    if cli.invite {
-        return create_invite(&state_dir, cli.expire_secs);
-    }
-
-    if let Some(target) = cli.remove.as_deref() {
-        return remove_peer_cmd(&state_dir, target);
-    }
 
     let _lock = acquire_daemon_lock(&state_dir)?;
 
@@ -126,18 +168,15 @@ async fn run() -> io::Result<()> {
     let local_origin = endpoint.id().to_string();
     let peers_path = state_dir.join(PEERS_FILE);
     let invites_path = state_dir.join(INVITES_FILE);
-    if let Some(ticket) = cli.ticket.as_deref() {
-        join_group(&endpoint, &peers_path, ticket, cli.name.clone()).await?;
-    }
     let group = Arc::new(RwLock::new(GroupState::load_or_init(
         peers_path,
         endpoint.id(),
-        cli.name.clone(),
+        name,
     )?));
     let topic_id = group.read().await.topic_id();
     let bootstrap = group.read().await.active_peers();
     let state = Arc::new(RwLock::new(FolderState::new(
-        cli.folder.clone(),
+        folder.clone(),
         local_origin.clone(),
     )?));
 
@@ -148,15 +187,15 @@ async fn run() -> io::Result<()> {
             &endpoint,
             topic_id,
             &bootstrap,
-            cli.poll,
-            cli.interval_ms,
+            poll,
+            interval_ms,
         );
     }
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
     let (rpc_event_tx, mut rpc_event_rx) = mpsc::unbounded_channel();
     let watch_root = state.read().await.root().to_path_buf();
-    let _watcher = watcher::spawn(watch_root, cli.interval_ms, cli.poll, fs_tx)?;
+    let _watcher = watcher::spawn(watch_root, interval_ms, poll, fs_tx)?;
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
     let rpc_client = rpc::RpcClient::new(endpoint.clone());
@@ -191,7 +230,7 @@ async fn run() -> io::Result<()> {
     publish_peers(&sender, Arc::clone(&group), &local_origin).await;
 
     let mut announce_interval =
-        tokio::time::interval(Duration::from_secs(cli.announce_interval_secs.max(1)));
+        tokio::time::interval(Duration::from_secs(announce_interval_secs.max(1)));
     announce_interval.tick().await;
 
     loop {
@@ -503,7 +542,7 @@ fn print_start(
     tracing::info!("node {}", endpoint.id());
     tracing::info!("topic {}", hex(*topic_id.as_bytes()));
     tracing::info!(
-        "invite command: lil --folder {} --invite",
+        "invite command: lil invite {}",
         state.root().display()
     );
     tracing::info!("known peers {}", bootstrap.len());

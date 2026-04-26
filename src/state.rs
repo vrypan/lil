@@ -113,16 +113,19 @@ pub struct FolderState {
 impl FolderState {
     pub fn new(root: PathBuf, origin: String) -> io::Result<Self> {
         let root = fs::canonicalize(root)?;
-        fs::create_dir_all(root.join(STATE_DIR))?;
+        let state_dir = root.join(STATE_DIR);
+        fs::create_dir_all(&state_dir)?;
+        let saved_lamport = load_saved_lamport(&state_dir);
         let mut state = Self {
             root,
             origin,
-            lamport: 0,
+            lamport: saved_lamport,
             entries: BTreeMap::new(),
             tree: TreeSnapshot::empty(),
             live_tree: TreeSnapshot::empty(),
         };
         state.rescan()?;
+        state.save_lamport();
         Ok(state)
     }
 
@@ -215,6 +218,7 @@ impl FolderState {
 
         let path = remote.path.clone();
         self.lamport = self.lamport.max(remote.version.lamport);
+        self.save_lamport();
         let old = self.entries.insert(path.clone(), remote.clone());
         let changed = std::slice::from_ref(&path);
         update_tree_snapshot(&mut self.tree, &self.entries, changed, |_| true);
@@ -309,6 +313,7 @@ impl FolderState {
             update_tree_snapshot(&mut self.live_tree, &self.entries, &changed_paths, |e| {
                 e.kind != EntryKind::Tombstone
             });
+            self.save_lamport();
         }
 
         Ok(changes)
@@ -408,6 +413,19 @@ impl FolderState {
             origin: self.origin.clone(),
         }
     }
+
+    fn save_lamport(&self) {
+        let path = self.root.join(STATE_DIR).join("lamport");
+        let _ = fs::write(path, self.lamport.to_le_bytes());
+    }
+}
+
+fn load_saved_lamport(state_dir: &Path) -> u64 {
+    fs::read(state_dir.join("lamport"))
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0)
 }
 
 fn remove_path_if_exists(path: &Path) -> io::Result<()> {
@@ -513,8 +531,10 @@ fn should_ignore(relative: &str, ignore_patterns: &[IgnorePattern]) -> bool {
     }) || matches_ignore_patterns(ignore_patterns, relative)
 }
 
+const LEGACY_STATE_DIRS: &[&str] = &[".tngl"];
+
 fn should_ignore_component(name: &str) -> bool {
-    name == STATE_DIR
+    name == STATE_DIR || LEGACY_STATE_DIRS.contains(&name)
         || IGNORED_FILE_NAMES.contains(&name)
         || IGNORED_FILE_PREFIXES
             .iter()
