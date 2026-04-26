@@ -295,6 +295,12 @@ async fn run_sync(
                 };
                 publish_sync_state(&sender, &snapshot, &local_origin).await;
                 publish_peers(&sender, Arc::clone(&group), &local_origin).await;
+                let active = group.read().await.active_peers();
+                if !active.is_empty() {
+                    if let Err(err) = sender.join_peers(active).await {
+                        tracing::warn!("re-join peers failed: {err}");
+                    }
+                }
             }
         }
     }
