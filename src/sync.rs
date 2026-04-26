@@ -62,6 +62,10 @@ pub async fn reconcile_with_peer(
         let _ = state.write().await.apply_paths(tombstoned);
     }
 
+    if !changes.is_empty() {
+        state.write().await.save_entries();
+    }
+
     Ok(changes)
 }
 

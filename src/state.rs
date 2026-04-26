@@ -116,11 +116,12 @@ impl FolderState {
         let state_dir = root.join(STATE_DIR);
         fs::create_dir_all(&state_dir)?;
         let saved_lamport = load_saved_lamport(&state_dir);
+        let saved_entries = load_saved_entries(&state_dir);
         let mut state = Self {
             root,
             origin,
             lamport: saved_lamport,
-            entries: BTreeMap::new(),
+            entries: saved_entries,
             tree: TreeSnapshot::empty(),
             live_tree: TreeSnapshot::empty(),
         };
@@ -341,6 +342,7 @@ impl FolderState {
                 e.kind != EntryKind::Tombstone
             });
             self.save_lamport();
+            self.save_entries();
         }
 
         Ok(changes)
@@ -437,6 +439,47 @@ impl FolderState {
         let path = self.root.join(STATE_DIR).join("lamport");
         let _ = fs::write(path, self.lamport.to_le_bytes());
     }
+
+    pub fn save_entries(&self) {
+        let path = self.root.join(STATE_DIR).join("entries.bin");
+        if let Ok(bytes) = bincode::serialize(&self.entries) {
+            let _ = fs::write(path, bytes);
+        }
+    }
+
+    /// Remove tombstones whose version lamport is at or below `min_confirmed_lamport`,
+    /// meaning all known peers have synced past that point and have the deletion.
+    /// Returns the number of tombstones removed.
+    pub fn gc_tombstones(&mut self, min_confirmed_lamport: u64) -> usize {
+        if min_confirmed_lamport == 0 {
+            return 0;
+        }
+        let to_remove: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.kind == EntryKind::Tombstone && e.version.lamport <= min_confirmed_lamport
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = to_remove.len();
+        if count > 0 {
+            for key in &to_remove {
+                self.entries.remove(key);
+            }
+            self.tree = derive_tree(&self.entries);
+            self.live_tree = derive_live_tree(&self.entries);
+        }
+        count
+    }
+}
+
+fn load_saved_entries(state_dir: &Path) -> BTreeMap<String, Entry> {
+    let path = state_dir.join("entries.bin");
+    fs::read(&path)
+        .ok()
+        .and_then(|bytes| bincode::deserialize(&bytes).ok())
+        .unwrap_or_default()
 }
 
 fn load_saved_lamport(state_dir: &Path) -> u64 {
@@ -1347,6 +1390,34 @@ mod tests {
         assert!(further_changes.is_empty(), "rescan found unexpected changes after delete");
         assert_eq!(state.root_hash(), after_delete_root);
         assert_eq!(state.live_root_hash(), after_delete_live);
+    }
+
+    #[test]
+    fn tombstone_survives_restart_and_gc_clears_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        assert_eq!(state.entry("a.txt").unwrap().kind, EntryKind::File);
+
+        // Delete the file and persist state.
+        fs::remove_file(tmp.path().join("a.txt")).unwrap();
+        state.apply_paths(vec![tmp.path().join("a.txt")]).unwrap();
+        assert_eq!(state.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
+        let tombstone_lamport = state.entry("a.txt").unwrap().version.lamport;
+
+        // Restart: tombstone must survive.
+        let state2 = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        assert_eq!(state2.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
+
+        // GC with threshold below tombstone lamport: nothing removed.
+        let mut state3 = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        assert_eq!(state3.gc_tombstones(tombstone_lamport - 1), 0);
+        assert_eq!(state3.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
+
+        // GC with threshold at or above tombstone lamport: tombstone removed.
+        assert_eq!(state3.gc_tombstones(tombstone_lamport), 1);
+        assert!(state3.entry("a.txt").is_none());
     }
 
     #[test]

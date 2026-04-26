@@ -187,10 +187,16 @@ async fn run_sync(
     )?));
     let topic_id = group.read().await.topic_id();
     let bootstrap = group.read().await.active_peers();
-    let state = Arc::new(RwLock::new(FolderState::new(
-        folder.clone(),
-        local_origin.clone(),
-    )?));
+    let state = {
+        let mut s = FolderState::new(folder.clone(), local_origin.clone())?;
+        let min_lamport = group.read().await.min_sync_lamport();
+        let gc_count = s.gc_tombstones(min_lamport);
+        if gc_count > 0 {
+            tracing::info!("gc removed {gc_count} stale tombstones");
+            s.save_entries();
+        }
+        Arc::new(RwLock::new(s))
+    };
 
     {
         let state = state.read().await;
@@ -422,7 +428,7 @@ async fn handle_gossip_event(
                         }
                     }
                 }
-                _ => maybe_probe_remote_rpc(rpc_client, message, state),
+                _ => maybe_probe_remote_rpc(rpc_client, message, state, Arc::clone(&group)),
             }
         }
         Ok(GossipEvent::NeighborUp(endpoint_id)) => {
@@ -505,6 +511,7 @@ fn maybe_probe_remote_rpc(
     rpc_client: rpc::RpcClient,
     message: GossipMessage,
     state: Arc<RwLock<FolderState>>,
+    group: Arc<RwLock<GroupState>>,
 ) {
     let (origin, remote_state_root, remote_live_root) = match message {
         GossipMessage::SyncState {
@@ -535,12 +542,20 @@ fn maybe_probe_remote_rpc(
             return;
         }
 
-        match sync::reconcile_with_peer(rpc_client, state, peer).await {
+        match sync::reconcile_with_peer(rpc_client, Arc::clone(&state), peer).await {
             Ok(changes) if changes.is_empty() => {
                 tracing::info!("sync peer={} no changes applied", peer);
             }
             Ok(changes) => {
                 tracing::info!("sync peer={} applied {} changes", peer, changes.len());
+                let local_lamport = state.read().await.lamport();
+                if let Err(err) = group
+                    .write()
+                    .await
+                    .update_sync_lamport(&peer.to_string(), local_lamport)
+                {
+                    tracing::warn!("update sync_lamport failed: {err}");
+                }
             }
             Err(err) => {
                 tracing::warn!("sync peer={} failed: {err}", peer);
