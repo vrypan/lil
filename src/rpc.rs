@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
-pub const ALPN: &[u8] = b"tngl/rpc/1";
+pub const ALPN: &[u8] = b"lil/rpc/1";
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -154,7 +154,7 @@ impl RpcClient {
             Ok(()) => Ok(()),
             Err(first_err) => {
                 self.drop_connection(peer).await;
-                tracing::debug!(target: "tngl::rpc", %peer, "retrying GetObject after: {first_err}");
+                tracing::debug!(target: "lil::rpc", %peer, "retrying GetObject after: {first_err}");
                 let connection = self.connection(peer).await?;
                 get_object_to_file_on_connection(
                     &connection,
@@ -214,7 +214,7 @@ impl RpcClient {
             Ok(response) => Ok(response),
             Err(first_err) => {
                 self.drop_connection(peer).await;
-                tracing::debug!(target: "tngl::rpc", %peer, "retrying RPC after connection error: {first_err}");
+                tracing::debug!(target: "lil::rpc", %peer, "retrying RPC after connection error: {first_err}");
                 let connection = self.connection(peer).await?;
                 round_trip_on_connection(&connection, peer, &request).await
             }
@@ -266,13 +266,13 @@ async fn handle_connection(
     events: mpsc::UnboundedSender<RpcEvent>,
 ) -> io::Result<()> {
     let peer = connection.remote_id();
-    tracing::debug!(target: "tngl::rpc", %peer, "incoming connection");
+    tracing::debug!(target: "lil::rpc", %peer, "incoming connection");
 
     loop {
         let (mut send, mut recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
             Err(err) if is_routine_connection_close(&err) => {
-                tracing::debug!(target: "tngl::rpc", %peer, "connection closed: {err}");
+                tracing::debug!(target: "lil::rpc", %peer, "connection closed: {err}");
                 return Ok(());
             }
             Err(err) => return Err(io::Error::other(format!("accept bi stream: {err}"))),
@@ -281,7 +281,7 @@ async fn handle_connection(
         let request: RequestMessage = read_frame(&mut recv)
             .await
             .map_err(|err| io::Error::other(format!("read request from {peer}: {err}")))?;
-        tracing::debug!(target: "tngl::rpc", %peer, "recv {:?}", request);
+        tracing::debug!(target: "lil::rpc", %peer, "recv {:?}", request);
         assert_eof(&mut recv)
             .await
             .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
@@ -295,7 +295,7 @@ async fn handle_connection(
         } else {
             let response =
                 handle_request(request, peer, &state, &group, &invites_path, &events).await;
-            tracing::debug!(target: "tngl::rpc", %peer, "send {:?}", response);
+            tracing::debug!(target: "lil::rpc", %peer, "send {:?}", response);
             write_frame(&mut send, &response)
                 .await
                 .map_err(|err| io::Error::other(format!("write response to {peer}: {err}")))?;

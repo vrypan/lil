@@ -4,8 +4,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-const STATE_DIR: &str = ".tngl";
-const IGNORE_FILE_NAME: &str = ".notngl";
+const STATE_DIR: &str = ".lil";
+const IGNORE_FILE_NAME: &str = ".nolil";
 const IGNORED_FILE_NAMES: &[&str] = &[".DS_Store", "Thumbs.db", "Desktop.ini"];
 const IGNORED_FILE_PREFIXES: &[&str] = &["._"];
 const IGNORED_DIR_NAMES: &[&str] = &[
@@ -934,7 +934,7 @@ fn display_prefix(path: &str) -> String {
 
 fn hash_entry(entry: &Entry) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    encode_str(&mut hasher, "tngl-entry-v1");
+    encode_str(&mut hasher, "lil-entry-v1");
     encode_str(&mut hasher, &entry.path);
     encode_str(&mut hasher, entry.kind.as_str());
     encode_opt_hash(&mut hasher, entry.content_hash);
@@ -951,7 +951,7 @@ fn hash_node(
     children: &BTreeMap<String, [u8; 32]>,
 ) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"tngl-node-v1");
+    hasher.update(b"lil-node-v1");
     encode_str(&mut hasher, prefix);
     for (name, hash) in entries {
         encode_str(&mut hasher, "entry");
@@ -1051,8 +1051,8 @@ mod tests {
     #[test]
     fn scan_ignores_state_and_os_metadata_paths() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::create_dir(tmp.path().join(".tngl")).unwrap();
-        fs::write(tmp.path().join(".tngl/private.key"), "secret").unwrap();
+        fs::create_dir(tmp.path().join(".lil")).unwrap();
+        fs::write(tmp.path().join(".lil/private.key"), "secret").unwrap();
         fs::write(tmp.path().join(".DS_Store"), "metadata").unwrap();
         fs::write(tmp.path().join("Thumbs.db"), "metadata").unwrap();
         fs::write(tmp.path().join("Desktop.ini"), "metadata").unwrap();
@@ -1066,7 +1066,7 @@ mod tests {
         let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
 
         assert!(state.entries.contains_key("keep.txt"));
-        assert!(!state.entries.contains_key(".tngl"));
+        assert!(!state.entries.contains_key(".lil"));
         assert!(!state.entries.contains_key(".DS_Store"));
         assert!(!state.entries.contains_key("Thumbs.db"));
         assert!(!state.entries.contains_key("Desktop.ini"));
@@ -1086,10 +1086,10 @@ mod tests {
     }
 
     #[test]
-    fn scan_respects_notngl_patterns() {
+    fn scan_respects_nolil_patterns() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(
-            tmp.path().join(".notngl"),
+            tmp.path().join(".nolil"),
             "ignored.txt\nlogs/\n*.tmp\n/sub/exact.txt\n",
         )
         .unwrap();
@@ -1104,7 +1104,7 @@ mod tests {
 
         let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
 
-        assert!(state.entries.contains_key(".notngl"));
+        assert!(state.entries.contains_key(".nolil"));
         assert!(state.entries.contains_key("keep.txt"));
         assert!(state.entries.contains_key("sub"));
         assert!(state.entries.contains_key("sub/keep.txt"));
@@ -1116,9 +1116,9 @@ mod tests {
     }
 
     #[test]
-    fn notngl_negation_reincludes_path() {
+    fn nolil_negation_reincludes_path() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(".notngl"), "*.tmp\n!keep.tmp\n").unwrap();
+        fs::write(tmp.path().join(".nolil"), "*.tmp\n!keep.tmp\n").unwrap();
         fs::write(tmp.path().join("drop.tmp"), "drop").unwrap();
         fs::write(tmp.path().join("keep.tmp"), "keep").unwrap();
 
@@ -1136,10 +1136,10 @@ mod tests {
         let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
         assert!(state.entries.contains_key("keep.txt"));
 
-        fs::write(tmp.path().join(".notngl"), "keep.txt\n").unwrap();
+        fs::write(tmp.path().join(".nolil"), "keep.txt\n").unwrap();
         let changes = state.rescan().unwrap();
 
-        assert!(changes.iter().any(|change| change.path == ".notngl"));
+        assert!(changes.iter().any(|change| change.path == ".nolil"));
         let ignored = state.entries.get("keep.txt").unwrap();
         assert_eq!(ignored.kind, EntryKind::Tombstone);
     }
@@ -1258,16 +1258,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_paths_falls_back_to_rescan_when_notngl_changes() {
+    fn apply_paths_falls_back_to_rescan_when_nolil_changes() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("keep.txt"), "keep").unwrap();
         let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
 
-        let notngl = tmp.path().join(".notngl");
+        let notngl = tmp.path().join(".nolil");
         fs::write(&notngl, "keep.txt\n").unwrap();
         let changes = state.apply_paths(vec![notngl]).unwrap();
 
-        assert!(changes.iter().any(|c| c.path == ".notngl"));
+        assert!(changes.iter().any(|c| c.path == ".nolil"));
         assert_eq!(
             state.entries.get("keep.txt").unwrap().kind,
             EntryKind::Tombstone

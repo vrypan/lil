@@ -1,5 +1,5 @@
 [package]
-name = "tngl-tools"
+name = "lilsync"
 version = "0.1.1"
 edition = "2024"
 description = "Mesh sync daemon for folders"
@@ -8,7 +8,7 @@ repository = "https://github.com/vrypan/fmesh"
 homepage = "https://github.com/vrypan/fmesh"
 
 [[bin]]
-name = "tngl"
+name = "lil"
 path = "src/main.rs"
 
 [dependencies]

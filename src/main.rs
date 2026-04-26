@@ -27,7 +27,7 @@ const PEERS_FILE: &str = "peers.json";
 const INVITES_FILE: &str = "invites.json";
 
 #[derive(Parser, Debug)]
-#[command(name = "tngl", about = "Monitor a folder and gossip tngl tree changes")]
+#[command(name = "lil", about = "Monitor a folder and lilsync folder daemon")]
 struct Cli {
     #[arg(long, value_name = "PATH", help = "Folder to monitor")]
     folder: PathBuf,
@@ -102,7 +102,7 @@ async fn run() -> io::Result<()> {
     let cli = Cli::parse();
     fs::create_dir_all(&cli.folder)?;
 
-    let state_dir = cli.folder.join(".tngl");
+    let state_dir = cli.folder.join(".lil");
     fs::create_dir_all(&state_dir)?;
 
     if cli.invite {
@@ -503,7 +503,7 @@ fn print_start(
     tracing::info!("node {}", endpoint.id());
     tracing::info!("topic {}", hex(*topic_id.as_bytes()));
     tracing::info!(
-        "invite command: tngl --folder {} --invite",
+        "invite command: lil --folder {} --invite",
         state.root().display()
     );
     tracing::info!("known peers {}", bootstrap.len());
@@ -656,7 +656,7 @@ fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::WouldBlock {
             return Err(io::Error::other(
-                "another tngl instance is already running on this folder",
+                "another lil instance is already running on this folder",
             ));
         }
         return Err(err);
@@ -673,7 +673,7 @@ fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
         .open(lock_path)
         .map_err(|err| {
             if err.kind() == io::ErrorKind::AlreadyExists {
-                io::Error::other("another tngl instance is already running on this folder")
+                io::Error::other("another lil instance is already running on this folder")
             } else {
                 err
             }
@@ -799,7 +799,7 @@ mod tests {
 
         assert_eq!(
             second.to_string(),
-            "another tngl instance is already running on this folder"
+            "another lil instance is already running on this folder"
         );
         drop(first);
         let _third = acquire_daemon_lock(tmp.path()).unwrap();
