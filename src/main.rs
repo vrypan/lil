@@ -315,8 +315,15 @@ async fn run_sync(
                 publish_peers(&sender, Arc::clone(&group), &local_origin).await;
                 let active = group.read().await.active_peers();
                 if !active.is_empty() {
-                    if let Err(err) = sender.join_peers(active).await {
-                        tracing::warn!("re-join peers failed: {err}");
+                    let join = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        sender.join_peers(active),
+                    )
+                    .await;
+                    match join {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => tracing::warn!("re-join peers failed: {err}"),
+                        Err(_) => tracing::warn!("re-join peers timed out"),
                     }
                 }
             }
@@ -384,8 +391,15 @@ async fn publish_peers(sender: &GossipSender, group: Arc<RwLock<GroupState>>, or
 
 async fn publish(sender: &GossipSender, message: GossipMessage) {
     tracing::debug!("gossip send {}", summarize_message(&message));
-    if let Err(err) = sender.broadcast(message.to_bytes().into()).await {
-        tracing::warn!("gossip publish failed: {err}");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        sender.broadcast(message.to_bytes().into()),
+    )
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => tracing::warn!("gossip publish failed: {err}"),
+        Err(_) => tracing::warn!("gossip publish timed out — connection likely dead"),
     }
 }
 
