@@ -77,6 +77,11 @@ enum Command {
         /// Node ID or name to remove
         target: String,
     },
+    /// List known peers
+    Peers {
+        /// Folder whose group to inspect
+        folder: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +122,12 @@ async fn run() -> io::Result<()> {
             let state_dir = folder.join(".lil");
             fs::create_dir_all(&state_dir)?;
             return remove_peer_cmd(&state_dir, &target);
+        }
+        Command::Peers { folder } => {
+            fs::create_dir_all(&folder)?;
+            let state_dir = folder.join(".lil");
+            fs::create_dir_all(&state_dir)?;
+            return peers_cmd(&state_dir);
         }
         Command::Join { folder, ticket, name } => {
             fs::create_dir_all(&folder)?;
@@ -635,6 +646,22 @@ fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
     group::add_invite(&state_dir.join(INVITES_FILE), &secret_hex, expires_at)?;
     println!("{}", encode_ticket(node_id, &secret_bytes));
     tracing::info!("invite expires in {}s", expire_secs);
+    Ok(())
+}
+
+fn peers_cmd(state_dir: &Path) -> io::Result<()> {
+    let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
+    let node_id = secret_key.public();
+    let peers_path = state_dir.join(PEERS_FILE);
+    let group = GroupState::load_or_init(peers_path, node_id, None)?;
+    for member in group.members() {
+        let label = match member.name.as_deref() {
+            Some(n) => format!("{} ({})", member.id, n),
+            None => member.id.clone(),
+        };
+        let marker = if member.id == node_id.to_string() { " [self]" } else { "" };
+        println!("{:?} {}{}", member.status, label, marker);
+    }
     Ok(())
 }
 
