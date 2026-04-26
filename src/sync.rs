@@ -46,6 +46,22 @@ pub async fn reconcile_with_peer(
         )
         .await?;
     }
+
+    // Post-reconciliation sweep: for every tombstone we accepted, re-run
+    // tombstone_descendants so any entries that arrived concurrently (from
+    // another reconciliation or watcher event) are cleaned up too.
+    let tombstoned: Vec<PathBuf> = {
+        let s = state.read().await;
+        changes
+            .iter()
+            .filter(|c| c.new.kind == EntryKind::Tombstone)
+            .map(|c| s.root().join(&c.path))
+            .collect()
+    };
+    if !tombstoned.is_empty() {
+        let _ = state.write().await.apply_paths(tombstoned);
+    }
+
     Ok(changes)
 }
 
