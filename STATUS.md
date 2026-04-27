@@ -1,6 +1,7 @@
 # lilsync Status
 
-Current branch: scratch rebuild around the `NEXT.md` radix tree state model.
+Current status: functional Rust daemon using directory-tree state hashes,
+iroh-gossip, and custom iroh RPC for reconciliation.
 
 ## Implemented
 
@@ -27,7 +28,7 @@ Degree: functional. The structure is a directory trie, not a compressed radix tr
 
 ### Folder Monitoring
 
-- `lil --folder <path>` monitors a folder and logs local tree changes.
+- `lil sync <path>` monitors a folder and logs local tree changes.
 - Native filesystem notifications are used by default through `notify`.
 - `--poll` is available as a fallback.
 - Changes are debounced by `--interval-ms`.
@@ -52,8 +53,10 @@ Degree: functional. There is no migration layer for older state formats.
 - Uses `iroh-gossip`.
 - Nodes publish periodic `SyncState` messages with root hashes, Lamport, and node counts.
 - Nodes publish real-time `FilesystemChanged` messages after local folder changes.
+  These messages gossip roots plus a bounded tree hint to reduce follow-up RPCs.
 - Nodes publish `Peers` messages containing the known membership ledger.
 - Received peer lists are merged and active peers are passed to `GossipSender::join_peers`.
+- `SyncState` messages include GC watermarks so peers can prune tombstones and reject stale entries consistently.
 
 Degree: functional for basic peer discovery and event propagation. Gossip messages are not authenticated beyond the iroh node identity of the connection layer, and there is no replay protection or membership signature scheme.
 
@@ -62,9 +65,11 @@ Degree: functional for basic peer discovery and event propagation. Gossip messag
 - All tracked entries (including tombstones) are persisted to `<folder>/.lil/entries.bin` in bincode format.
 - On startup, persisted entries are loaded before the filesystem scan so tombstones survive restarts and deleted files are not re-synced.
 - Entry state is written after every watcher batch (`apply_paths`) and after each reconciliation pass.
-- Tombstone GC runs on startup: tombstones with `version.lamport <= min(sync_lamport across all active peers)` are removed. `sync_lamport` per peer is persisted in `peers.json` and updated after each successful reconciliation.
+- GC watermarks are persisted to `<folder>/.lil/gc-watermark.bin`.
+- Tombstone GC advances only after all active peers report the same state root. The node records a per-origin watermark for tombstones covered by that converged root, prunes them, and gossips the watermark through `SyncState`.
+- Entries at or below a known GC watermark are rejected so stale tombstones or files are not resurrected by lagging peers.
 
-Degree: functional. GC is conservative — a tombstone is only removed when all known active peers have confirmed they synced past it. Peers that were never online together may retain stale tombstones indefinitely until they sync.
+Degree: functional. GC is conservative — a tombstone is only removed when all active peers have reported the same state root. Offline active peers delay pruning until they return and sync, or until they are removed from membership.
 
 ### Minimal RPC API
 
@@ -84,6 +89,7 @@ Degree: functional. Tree/file RPCs are gated to active group members. The join R
 
 - On receiving a remote root mismatch, a node probes the remote peer over RPC.
 - Reconciliation descends changed tree nodes by comparing hashes.
+- `FilesystemChanged` gossip can provide validated tree nodes as hints, avoiding some `GetNode` RPCs while staying capped below the gossip message budget.
 - Changed entries are resolved by version ordering.
 - Remote files are fetched by `content_hash` through `GetObject`.
 - Remote directories and tombstones are applied locally.
@@ -102,7 +108,7 @@ Tombstone correctness guarantees:
 - Any node can create a one-time ticket with:
 
 ```text
-lil --folder <folder> --invite
+lil invite <folder>
 ```
 
 - Tickets are a compact 86-character base62 string encoding the 32-byte issuer node ID and 32-byte secret concatenated.
@@ -110,26 +116,28 @@ lil --folder <folder> --invite
 - A joining node uses:
 
 ```text
-lil --folder <folder> --ticket <86-char-base62-ticket>
+lil join <folder> <86-char-base62-ticket>
 ```
 
 - The issuer validates and consumes the ticket.
 - The issuer adds the joiner to the peer ledger.
 - The join response returns the gossip topic ID and full peer list.
+- `lil join ... --exit` writes the joined group state and exits instead of starting the daemon, for service-manager setup.
 - The issuer broadcasts the updated peer list through gossip.
 - Other peers merge newer member entries by Lamport.
 
-Degree: functional for adding and removing peers. Peers can announce a human-readable `--name`; names propagate via the Join RPC and Peers gossip. Any peer can remove another with `lil --remove <id|name>`; the change persists to `peers.json` and broadcasts on next daemon start.
+Degree: functional for adding and removing peers. Peers can announce a human-readable `--name`; names propagate via the Join RPC and Peers gossip. Any peer can remove another with `lil remove <folder> <id|name>`; the change persists to `peers.json` and broadcasts on next daemon start.
 
 ## Verified
 
-- Unit tests cover state hashing, tombstones, ignore rules, key reuse, daemon locking, invite consumption, peer merge behavior, gossip message serialization, remote apply behavior, tombstone persistence across restarts, and tombstone GC threshold behaviour.
+- Unit tests cover state hashing, tombstones, ignore rules, key reuse, daemon locking, invite consumption, peer merge behavior, gossip message serialization, remote apply behavior, tombstone persistence across restarts, GC watermarks, and bounded tree hints.
 - Latest verification run:
 
 ```text
 cargo fmt -- --check
-cargo test
 cargo check
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
 
 - Manual smoke tests verified:
@@ -147,7 +155,7 @@ cargo check
 - No explicit conflict file strategy when concurrent versions tie in unexpected ways.
 - No peer revocation workflow (removal is trust-based; no signed membership ledger).
 - No signed membership ledger.
-- No encrypted file transfer or application-level authorization beyond iroh node identity plus local peer membership.
+- No application-level content encryption beyond iroh transport encryption, and no authorization beyond iroh node identity plus local peer membership.
 - No long-running integration test harness yet.
 - NAT traversal warnings from iroh/quinn can still appear on new connections; current RPC connection reuse reduces repeated RPC warnings but does not eliminate the underlying warning.
 
@@ -170,6 +178,12 @@ Join from another folder (starts the daemon after a successful join):
 
 ```text
 lil join ./tmp2 <86-char-base62-ticket>
+```
+
+Join from another folder and exit so a service can start the daemon later:
+
+```text
+lil join ./tmp2 <86-char-base62-ticket> --exit
 ```
 
 List known peers:
