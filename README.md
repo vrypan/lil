@@ -1,20 +1,23 @@
-
 > [!WARNING]
-> `lil` is experimental. **There may be bugs that could DELETE or EXPOSE
-> your files.**
+> `lil` is **experimental**! There may be bugs that could DELETE or EXPOSE
+> your files. I use it, but **use it at your own risk.**
 
 # lil — a little tool to sync your files
 
 `lil` syncs a folder between a small, **trusted** group of nodes.
 
-It is designed for peer-to-peer sync between your own machines or
-other trusted peers. Each node keeps a full local copy of the synced folder.
-Any node in the group can create a ticket that allows a new node to join.
+- Designed for peer-to-peer sync between your own machines or other trusted
+  peers.
 
-`lil` uses [iroh and iroh-gossip](https://www.iroh.computer) for end-to-end
-encrypted connections over QUIC. Connections work even when nodes are behind
-a firewall — iroh relay servers facilitate the handshake but cannot see the
-encrypted data.
+- End-to-end encrypted: `lil` uses
+  [iroh and iroh-gossip](https://www.iroh.computer) for end-to-end encrypted 
+  connections over QUIC.
+
+- Connections work even when nodes are behind NAT. Iroh relay servers
+  facilitate the handshake but cannot see the encrypted data.
+
+- No central node: every node is equal. Each keeps a full copy of the synced
+  folder and each can invite new nodes.
 
 > [!NOTE]
 > See [SECURITY.md](SECURITY.md) for the full threat model and known limitations.
@@ -45,6 +48,7 @@ State is stored inside the synced folder under `.lil/`:
 | `invites.json` | Pending invite tokens |
 | `entries.bin` | Persisted entry index (survives restarts) |
 | `lamport` | Persisted Lamport clock |
+| `gc-watermark.bin` | Persisted tombstone garbage-collection watermark |
 
 ## Adding a Second Node
 
@@ -109,9 +113,11 @@ being tracked locally; they are **not** deleted on remote peers.
   memory; BLAKE3 hash is verified before the temp file is renamed into place.
 - Up to 8 file downloads run in parallel per reconciliation pass.
 - Periodic `SyncState` broadcasts (default every 10 s) drive repair: any node
-  with a different root hash initiates a Merkle tree sync.
+  with a different root hash initiates a Merkle tree sync. Filesystem-change
+  gossip also includes a small bounded tree hint to reduce follow-up RPCs.
 - Tombstones (records of deleted files) are persisted across restarts and
-  garbage-collected once all active peers have confirmed they synced past them.
+  garbage-collected after all active peers report the same state root. Nodes
+  publish GC watermarks so stale tombstones are not accepted again later.
 - Some OS metadata files are always ignored: `.DS_Store`, `Thumbs.db`,
   `Desktop.ini`, `._*`, `.Spotlight-V100`, `$RECYCLE.BIN`, `lost+found`.
 - Empty directories are not tracked. If the last file in a directory is
