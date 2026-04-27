@@ -232,10 +232,10 @@ async fn run_sync(
         .await
         .map_err(io::Error::other)?;
     let (sender, mut receiver) = topic.split();
-    if !bootstrap.is_empty() {
-        if let Err(err) = sender.join_peers(bootstrap).await {
-            tracing::warn!("join known peers failed: {err}");
-        }
+    if !bootstrap.is_empty()
+        && let Err(err) = sender.join_peers(bootstrap).await
+    {
+        tracing::warn!("join known peers failed: {err}");
     }
 
     {
@@ -827,13 +827,6 @@ fn maybe_probe_remote_rpc(
                     let state = state.read().await;
                     StateSnapshot::from_state(&state)
                 };
-                if let Err(err) = group
-                    .write()
-                    .await
-                    .update_sync_lamport(&peer.to_string(), snapshot.lamport)
-                {
-                    tracing::warn!("update sync_lamport failed: {err}");
-                }
                 publish_sync_state(&sender, &snapshot, &local_origin).await;
                 maybe_gc_tombstones(
                     Arc::clone(&state),

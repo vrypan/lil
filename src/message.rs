@@ -106,7 +106,6 @@ mod tests {
                 name: Some("alice".to_string()),
                 status: crate::group::MemberStatus::Active,
                 lamport: 1,
-                sync_lamport: 0,
             }],
         };
 

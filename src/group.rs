@@ -22,10 +22,6 @@ pub struct MemberEntry {
     pub lamport: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Local sync progress retained for diagnostics and older peer files.
-    /// Tombstone GC now uses root convergence plus state GC watermarks.
-    #[serde(default, skip_serializing_if = "crate::group::is_zero")]
-    pub sync_lamport: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +83,6 @@ impl GroupState {
                         name,
                         status: MemberStatus::Active,
                         lamport,
-                        sync_lamport: 0,
                     },
                 );
             } else {
@@ -159,7 +154,6 @@ impl GroupState {
                         name,
                         status: MemberStatus::Active,
                         lamport,
-                        sync_lamport: 0,
                     },
                 );
                 true
@@ -223,28 +217,9 @@ impl GroupState {
         })
     }
 
-    /// Record the local file-state lamport at the time of a successful sync with `peer_id`.
-    /// Returns true if the value was updated.
-    pub fn update_sync_lamport(&mut self, peer_id: &str, lamport: u64) -> io::Result<bool> {
-        let Some(entry) = self.members.get_mut(peer_id) else {
-            return Ok(false);
-        };
-        if lamport <= entry.sync_lamport {
-            return Ok(false);
-        }
-        entry.sync_lamport = lamport;
-        self.persist()?;
-        Ok(true)
-    }
-
     fn persist(&self) -> io::Result<()> {
         save_peers_file(&self.path, self.topic_id, self.members())
     }
-}
-
-#[doc(hidden)]
-pub fn is_zero(v: &u64) -> bool {
-    *v == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -397,7 +372,6 @@ mod tests {
                 name: None,
                 status: MemberStatus::Active,
                 lamport: 2,
-                sync_lamport: 0,
             }])
             .unwrap();
         assert!(update.changed);
@@ -409,7 +383,6 @@ mod tests {
                 name: None,
                 status: MemberStatus::Removed,
                 lamport: 1,
-                sync_lamport: 0,
             }])
             .unwrap();
         assert!(!update.changed);

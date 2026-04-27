@@ -55,14 +55,17 @@ pub async fn reconcile_with_advertised_root(
     }
 
     let hinted_nodes = hint.map(HintedNodes::from).unwrap_or_default();
+    let ctx = ReconcileContext {
+        rpc: &rpc,
+        state: &state,
+        peer,
+        hinted_nodes: &hinted_nodes,
+    };
     let mut changes = Vec::new();
     let mut stack = vec![("".to_string(), remote_root)];
     while let Some((prefix, remote_hash)) = stack.pop() {
         reconcile_node(
-            &rpc,
-            &state,
-            peer,
-            &hinted_nodes,
+            &ctx,
             &prefix,
             remote_hash,
             &mut changes,
@@ -93,18 +96,22 @@ pub async fn reconcile_with_advertised_root(
     Ok(changes)
 }
 
-async fn reconcile_node(
-    rpc: &RpcClient,
-    state: &Arc<RwLock<FolderState>>,
+struct ReconcileContext<'a> {
+    rpc: &'a RpcClient,
+    state: &'a Arc<RwLock<FolderState>>,
     peer: PublicKey,
-    hinted_nodes: &HintedNodes,
+    hinted_nodes: &'a HintedNodes,
+}
+
+async fn reconcile_node(
+    ctx: &ReconcileContext<'_>,
     prefix: &str,
     expected_remote_hash: [u8; 32],
     changes: &mut Vec<Change>,
     stack: &mut Vec<(String, [u8; 32])>,
 ) -> io::Result<()> {
     let local_node = {
-        let state = state.read().await;
+        let state = ctx.state.read().await;
         state.node(prefix)
     };
     if local_node
@@ -114,17 +121,19 @@ async fn reconcile_node(
         return Ok(());
     }
 
-    let remote_node = match hinted_nodes.get(prefix, expected_remote_hash) {
+    let remote_node = match ctx.hinted_nodes.get(prefix, expected_remote_hash) {
         Some(node) => node,
-        None => rpc.get_node(peer, prefix).await?.ok_or_else(|| {
+        None => ctx.rpc.get_node(ctx.peer, prefix).await?.ok_or_else(|| {
             io::Error::other(format!(
-                "peer {peer} did not return node for prefix {prefix:?}"
+                "peer {} did not return node for prefix {prefix:?}",
+                ctx.peer
             ))
         })?,
     };
     if remote_node.hash != expected_remote_hash {
         return Err(io::Error::other(format!(
-            "peer {peer} returned stale node {}: expected {}, got {}",
+            "peer {} returned stale node {}: expected {}, got {}",
+            ctx.peer,
             remote_node.prefix,
             hex(expected_remote_hash),
             hex(remote_node.hash)
@@ -132,9 +141,9 @@ async fn reconcile_node(
     }
 
     reconcile_entries(
-        rpc,
-        state,
-        peer,
+        ctx.rpc,
+        ctx.state,
+        ctx.peer,
         prefix,
         local_node.as_ref(),
         &remote_node,

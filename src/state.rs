@@ -413,7 +413,10 @@ impl FolderState {
 
     fn update_entry(&mut self, path: &str, live: Entry, changes: &mut Vec<Change>) {
         let existing = self.entries.get(path).cloned();
-        if existing.as_ref().map_or(false, |o| same_observed_state(o, &live)) {
+        if existing
+            .as_ref()
+            .is_some_and(|o| same_observed_state(o, &live))
+        {
             return;
         }
         let mut new = live;
@@ -495,26 +498,6 @@ impl FolderState {
             return 0;
         }
         self.merge_gc_watermark(&watermark).1
-    }
-
-    /// Remove tombstones whose version lamport is at or below `min_confirmed_lamport`,
-    /// meaning all known peers have synced past that point and have the deletion.
-    /// Returns the number of tombstones removed.
-    #[cfg(test)]
-    pub fn gc_tombstones(&mut self, min_confirmed_lamport: u64) -> usize {
-        if min_confirmed_lamport == 0 {
-            return 0;
-        }
-        let mut watermark = GcWatermark::new();
-        for entry in self.entries.values() {
-            if entry.kind == EntryKind::Tombstone && entry.version.lamport <= min_confirmed_lamport
-            {
-                let lamport = watermark.entry(entry.version.origin.clone()).or_insert(0);
-                *lamport = (*lamport).max(entry.version.lamport);
-            }
-        }
-        let (_, pruned) = self.merge_gc_watermark(&watermark);
-        pruned
     }
 
     fn is_version_gced(&self, version: &Version) -> bool {
@@ -918,7 +901,7 @@ fn update_tree_snapshot(
         if !snapshot.nodes.contains_key(path) {
             continue;
         }
-        let still_included = entries.get(path).map_or(false, |e| include(e));
+        let still_included = entries.get(path).is_some_and(&include);
         if still_included {
             continue;
         }
@@ -1481,7 +1464,7 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_survives_restart_and_gc_clears_it() {
+    fn tombstone_survives_restart_and_converged_gc_clears_it() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("a.txt"), "hello").unwrap();
 
@@ -1492,20 +1475,14 @@ mod tests {
         fs::remove_file(tmp.path().join("a.txt")).unwrap();
         state.apply_paths(vec![tmp.path().join("a.txt")]).unwrap();
         assert_eq!(state.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
-        let tombstone_lamport = state.entry("a.txt").unwrap().version.lamport;
 
         // Restart: tombstone must survive.
-        let state2 = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
-        assert_eq!(state2.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        assert_eq!(state.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
 
-        // GC with threshold below tombstone lamport: nothing removed.
-        let mut state3 = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
-        assert_eq!(state3.gc_tombstones(tombstone_lamport - 1), 0);
-        assert_eq!(state3.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
-
-        // GC with threshold at or above tombstone lamport: tombstone removed.
-        assert_eq!(state3.gc_tombstones(tombstone_lamport), 1);
-        assert!(state3.entry("a.txt").is_none());
+        // GC after root convergence records a watermark and removes the tombstone.
+        assert_eq!(state.gc_tombstones_for_converged_root(), 1);
+        assert!(state.entry("a.txt").is_none());
     }
 
     #[test]
