@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RequestMessage {
     Join {
@@ -80,6 +82,7 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let len = recv.read_u32().await? as usize;
+    validate_frame_len(len)?;
     let mut bytes = vec![0; len];
     recv.read_exact(&mut bytes)
         .await
@@ -97,11 +100,38 @@ pub async fn close_send(send: &mut iroh::endpoint::SendStream) -> io::Result<()>
     }
 }
 
+fn validate_frame_len(len: usize) -> io::Result<()> {
+    if len > MAX_FRAME_BYTES {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame length {len} exceeds maximum {MAX_FRAME_BYTES}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub async fn assert_eof(recv: &mut iroh::endpoint::RecvStream) -> io::Result<()> {
     let trailing = recv.read_to_end(1).await.map_err(io::Error::other)?;
     if trailing.is_empty() {
         Ok(())
     } else {
         Err(io::Error::other("unexpected trailing bytes after frame"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_frame_at_size_limit() {
+        validate_frame_len(MAX_FRAME_BYTES).unwrap();
+    }
+
+    #[test]
+    fn rejects_oversized_frame_before_allocation() {
+        let err = validate_frame_len(MAX_FRAME_BYTES + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

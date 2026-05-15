@@ -133,7 +133,10 @@ impl FolderState {
         if state.prune_tombstones_covered_by_watermark() > 0 {
             state.save_entries();
         }
-        state.rescan()?;
+        let changes = state.rescan()?;
+        if !changes.is_empty() {
+            state.save_entries();
+        }
         state.save_lamport();
         Ok(state)
     }
@@ -229,7 +232,7 @@ impl FolderState {
                 self.install_remote_file(&remote, tmp)?;
             }
             EntryKind::Dir => {
-                fs::create_dir_all(self.root.join(&remote.path))?;
+                install_remote_dir(&self.root.join(&remote.path))?;
             }
             EntryKind::Tombstone => {
                 remove_path_if_exists(&self.root.join(&remote.path))?;
@@ -238,34 +241,13 @@ impl FolderState {
 
         let path = remote.path.clone();
         self.lamport = self.lamport.max(remote.version.lamport);
-        self.save_lamport();
         let old = self.entries.insert(path.clone(), remote.clone());
 
-        // Tombstone all live descendants so the entries map stays consistent
-        // with the filesystem after a directory deletion.
         let mut extra_changes = Vec::new();
-        if remote.kind == EntryKind::Tombstone {
-            let prefix = format!("{path}/");
-            let children: Vec<String> = self
-                .entries
-                .keys()
-                .filter(|p| p.starts_with(&prefix))
-                .cloned()
-                .collect();
-            for child in children {
-                let child_entry = self.entries.get(&child).cloned().unwrap();
-                if child_entry.kind != EntryKind::Tombstone {
-                    let version = self.next_version();
-                    let new = tombstone_entry(&child, &child_entry, version);
-                    self.entries.insert(child.clone(), new.clone());
-                    extra_changes.push(Change {
-                        path: child,
-                        old: Some(child_entry),
-                        new,
-                    });
-                }
-            }
+        if remote.kind != EntryKind::Dir {
+            self.tombstone_child_descendants(&path, &mut extra_changes);
         }
+        self.save_lamport();
 
         let mut changed_paths: Vec<String> = vec![path.clone()];
         changed_paths.extend(extra_changes.iter().map(|c| c.path.clone()));
@@ -288,6 +270,7 @@ impl FolderState {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
+        remove_path_if_exists(&dest)?;
         fs::rename(tmp_path, &dest)?;
 
         #[cfg(unix)]
@@ -438,6 +421,10 @@ impl FolderState {
         {
             return;
         }
+        let replaces_dir_with_non_dir = existing
+            .as_ref()
+            .is_some_and(|old| old.kind == EntryKind::Dir)
+            && live.kind != EntryKind::Dir;
         let mut new = live;
         new.version = self.next_version();
         self.entries.insert(path.to_string(), new.clone());
@@ -446,6 +433,9 @@ impl FolderState {
             old: existing,
             new,
         });
+        if replaces_dir_with_non_dir {
+            self.tombstone_child_descendants(path, changes);
+        }
     }
 
     fn tombstone_descendants(&mut self, relative: &str, changes: &mut Vec<Change>) {
@@ -454,6 +444,30 @@ impl FolderState {
             .entries
             .keys()
             .filter(|p| **p == relative || p.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for path in to_tombstone {
+            let old = self.entries.get(&path).cloned().unwrap();
+            if old.kind == EntryKind::Tombstone {
+                continue;
+            }
+            let version = self.next_version();
+            let new = tombstone_entry(&path, &old, version);
+            self.entries.insert(path.clone(), new.clone());
+            changes.push(Change {
+                path,
+                old: Some(old),
+                new,
+            });
+        }
+    }
+
+    fn tombstone_child_descendants(&mut self, relative: &str, changes: &mut Vec<Change>) {
+        let prefix = format!("{relative}/");
+        let to_tombstone: Vec<String> = self
+            .entries
+            .keys()
+            .filter(|p| p.starts_with(&prefix))
             .cloned()
             .collect();
         for path in to_tombstone {
@@ -587,6 +601,18 @@ fn remove_path_if_exists(path: &Path) -> io::Result<()> {
         Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
         Ok(_) => fs::remove_file(path),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn install_remote_dir(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => {
+            remove_path_if_exists(path)?;
+            fs::create_dir_all(path)
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path),
         Err(err) => Err(err),
     }
 }
@@ -1405,6 +1431,57 @@ mod tests {
     }
 
     #[test]
+    fn remote_file_replaces_local_directory_and_tombstones_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/a.txt"), "local").unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let bytes = b"remote file\n";
+        let remote = Entry {
+            path: "sub".to_string(),
+            kind: EntryKind::File,
+            content_hash: Some(*blake3::hash(bytes).as_bytes()),
+            size: bytes.len() as u64,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        let tmp_path = state.tmp_recv_path(&remote);
+        fs::write(&tmp_path, bytes).unwrap();
+        state.apply_remote_entry(remote, Some(&tmp_path)).unwrap();
+
+        assert_eq!(fs::read(tmp.path().join("sub")).unwrap(), bytes);
+        assert_eq!(state.entry("sub").unwrap().kind, EntryKind::File);
+        assert_eq!(state.entry("sub/a.txt").unwrap().kind, EntryKind::Tombstone);
+    }
+
+    #[test]
+    fn remote_directory_replaces_local_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("sub"), "local").unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let remote = Entry {
+            path: "sub".to_string(),
+            kind: EntryKind::Dir,
+            content_hash: None,
+            size: 0,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        state.apply_remote_entry(remote, None).unwrap();
+
+        assert!(tmp.path().join("sub").is_dir());
+        assert_eq!(state.entry("sub").unwrap().kind, EntryKind::Dir);
+    }
+
+    #[test]
     fn rejects_remote_paths_outside_sync_root() {
         let tmp = tempfile::tempdir().unwrap();
         let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
@@ -1568,6 +1645,30 @@ mod tests {
     }
 
     #[test]
+    fn apply_paths_tombstones_children_when_file_replaces_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/a.txt"), "local").unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+
+        fs::remove_dir_all(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub"), "replacement").unwrap();
+        let changes = state.apply_paths(vec![tmp.path().join("sub")]).unwrap();
+
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "sub" && c.new.kind == EntryKind::File)
+        );
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.path == "sub/a.txt" && c.new.kind == EntryKind::Tombstone)
+        );
+        assert_eq!(state.entry("sub/a.txt").unwrap().kind, EntryKind::Tombstone);
+    }
+
+    #[test]
     fn apply_paths_falls_back_to_rescan_when_nolil_changes() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("keep.txt"), "keep").unwrap();
@@ -1643,6 +1744,25 @@ mod tests {
         // GC after root convergence records a watermark and removes the tombstone.
         assert_eq!(state.gc_tombstones_for_converged_root(), 1);
         assert!(state.entry("a.txt").is_none());
+    }
+
+    #[test]
+    fn startup_rescan_persists_offline_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "one").unwrap();
+
+        let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        assert_eq!(state.entry("a.txt").unwrap().version.lamport, 1);
+        drop(state);
+
+        fs::write(tmp.path().join("a.txt"), "two").unwrap();
+        let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let offline_version = state.entry("a.txt").unwrap().version;
+        assert_eq!(offline_version.lamport, 2);
+        drop(state);
+
+        let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        assert_eq!(state.entry("a.txt").unwrap().version, offline_version);
     }
 
     #[test]
