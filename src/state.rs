@@ -185,6 +185,9 @@ impl FolderState {
     }
 
     pub fn should_accept_remote(&self, remote: &Entry) -> bool {
+        if validate_remote_path(&remote.path).is_err() {
+            return false;
+        }
         if self.is_version_gced(&remote.version) {
             return false;
         }
@@ -207,6 +210,7 @@ impl FolderState {
         remote: Entry,
         object_tmp_path: Option<&Path>,
     ) -> io::Result<Option<Change>> {
+        validate_remote_path(&remote.path)?;
         if !self.should_accept_remote(&remote) {
             if let Some(tmp) = object_tmp_path {
                 let _ = fs::remove_file(tmp);
@@ -585,6 +589,54 @@ fn remove_path_if_exists(path: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+fn validate_remote_path(path: &str) -> io::Result<()> {
+    if path.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote path must not be empty",
+        ));
+    }
+    if path.contains('\0') || path.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid remote path {path:?}"),
+        ));
+    }
+
+    let mut components = path.split('/');
+    if components.any(|component| {
+        component.is_empty()
+            || component == "."
+            || component == ".."
+            || should_ignore_component(component)
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid remote path {path:?}"),
+        ));
+    }
+
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid remote path {path:?}"),
+        ));
+    }
+
+    Ok(())
 }
 
 impl TreeSnapshot {
@@ -1350,6 +1402,83 @@ mod tests {
         assert_eq!(fs::read(tmp.path().join("remote.txt")).unwrap(), bytes);
         assert_eq!(state.entry("remote.txt").unwrap().version.lamport, 10);
         assert_eq!(state.lamport(), 10);
+    }
+
+    #[test]
+    fn rejects_remote_paths_outside_sync_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let bytes = b"remote\n";
+        let remote = Entry {
+            path: "../outside.txt".to_string(),
+            kind: EntryKind::File,
+            content_hash: Some(*blake3::hash(bytes).as_bytes()),
+            size: bytes.len() as u64,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+        let tmp_path = tmp.path().join(".lil").join("recv-path-test");
+        fs::write(&tmp_path, bytes).unwrap();
+
+        assert!(!state.should_accept_remote(&remote));
+        let err = state
+            .apply_remote_entry(remote, Some(&tmp_path))
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!tmp.path().join("..").join("outside.txt").exists());
+    }
+
+    #[test]
+    fn rejects_remote_paths_inside_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let remote = Entry {
+            path: ".lil/private.key".to_string(),
+            kind: EntryKind::Tombstone,
+            content_hash: None,
+            size: 0,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        assert!(!state.should_accept_remote(&remote));
+        let err = state.apply_remote_entry(remote, None).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn rejects_absolute_and_malformed_remote_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+
+        for path in [
+            "/tmp/outside.txt",
+            "sub//file.txt",
+            "sub/./file.txt",
+            r"sub\file.txt",
+        ] {
+            let remote = Entry {
+                path: path.to_string(),
+                kind: EntryKind::Tombstone,
+                content_hash: None,
+                size: 0,
+                mode: None,
+                version: Version {
+                    lamport: 10,
+                    origin: "node-b".to_string(),
+                },
+            };
+
+            assert!(!state.should_accept_remote(&remote));
+        }
     }
 
     #[test]
