@@ -19,9 +19,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+};
 use std::time::Duration;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 
 const KEY_FILE: &str = "private.key";
 const PEERS_FILE: &str = "peers.json";
@@ -33,6 +36,46 @@ const MAX_FILESYSTEM_CHANGED_BYTES: usize = 3_000;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Default)]
+struct SyncActivity {
+    active: AtomicBool,
+    pending_rescan: AtomicBool,
+}
+
+impl SyncActivity {
+    fn begin(&self) {
+        self.active.store(true, AtomicOrdering::SeqCst);
+    }
+
+    fn end(&self) {
+        self.active.store(false, AtomicOrdering::SeqCst);
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(AtomicOrdering::SeqCst)
+    }
+
+    fn defer_rescan(&self) {
+        self.pending_rescan.store(true, AtomicOrdering::SeqCst);
+    }
+
+    fn take_pending_rescan(&self) -> bool {
+        self.pending_rescan.swap(false, AtomicOrdering::SeqCst)
+    }
+}
+
+#[derive(Clone)]
+struct DaemonShared {
+    state: Arc<RwLock<FolderState>>,
+    group: Arc<RwLock<GroupState>>,
+    root_reports: Arc<RwLock<RootReports>>,
+    downloads: sync::DownloadCoordinator,
+    sync_activity: Arc<SyncActivity>,
+    reconcile_gate: Arc<Mutex<()>>,
+    publisher: rpc::RpcClient,
+    local_origin: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -203,6 +246,8 @@ async fn run_sync(
     };
     let root_reports = Arc::new(RwLock::new(RootReports::default()));
     let downloads = sync::DownloadCoordinator::default();
+    let sync_activity = Arc::new(SyncActivity::default());
+    let reconcile_gate = Arc::new(Mutex::new(()));
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
     let (rpc_event_tx, mut rpc_event_rx) = mpsc::unbounded_channel();
@@ -220,6 +265,16 @@ async fn run_sync(
     .await?;
     let mdns = discovery::spawn(local_id, rpc_port, Arc::clone(&address_book))?;
     let rpc_client = rpc::RpcClient::new(Arc::clone(&identity), Arc::clone(&address_book));
+    let shared = DaemonShared {
+        state: Arc::clone(&state),
+        group: Arc::clone(&group),
+        root_reports: Arc::clone(&root_reports),
+        downloads: downloads.clone(),
+        sync_activity: Arc::clone(&sync_activity),
+        reconcile_gate: Arc::clone(&reconcile_gate),
+        publisher: rpc_client.clone(),
+        local_origin: local_origin.clone(),
+    };
 
     {
         let state = state.read().await;
@@ -260,40 +315,19 @@ async fn run_sync(
                 return Ok(());
             }
             Some(paths) = fs_rx.recv() => {
-                let update = {
-                    let mut state = state.write().await;
-                    let before_state = state.root_hash();
-                    let before_live = state.live_root_hash();
-                    let result = if paths.is_empty() {
-                        state.rescan()
-                    } else {
-                        state.apply_paths(paths)
-                    };
-                    match result {
-                        Ok(changes) if changes.is_empty() => None,
-                        Ok(changes) => {
-                            print_changes(before_state, before_live, &state, &changes);
-                            let snapshot = StateSnapshot::from_state(&state);
-                            let hint = build_tree_hint(&state, &changes, &snapshot, &local_origin);
-                            Some((changes, snapshot, hint))
-                        }
-                        Err(err) => {
-                            tracing::warn!("scan failed: {err}");
-                            None
-                        }
-                    }
-                };
-                if let Some((changes, snapshot, hint)) = update {
-                    tracing::info!("filesystem changed paths={}", changes.len());
-                    publish_filesystem_changed(
-                        &rpc_client,
-                        Arc::clone(&group),
-                        &snapshot,
-                        &local_origin,
-                        hint,
-                    )
-                    .await;
+                if sync_activity.is_active() {
+                    sync_activity.defer_rescan();
+                    tracing::debug!("filesystem event deferred while remote sync is active");
+                    continue;
                 }
+                apply_filesystem_paths(
+                    Arc::clone(&state),
+                    &rpc_client,
+                    Arc::clone(&group),
+                    &local_origin,
+                    paths,
+                )
+                .await;
             }
             Some(event) = rpc_event_rx.recv() => {
                 match event {
@@ -306,15 +340,7 @@ async fn run_sync(
                     }
                     rpc::RpcEvent::Announcement { peer, message } => {
                         tracing::debug!("announcement from {peer}");
-                        handle_announcement(
-                            message,
-                            rpc_client.clone(),
-                            Arc::clone(&state),
-                            Arc::clone(&group),
-                            Arc::clone(&root_reports),
-                            downloads.clone(),
-                            &local_origin,
-                        ).await?;
+                        handle_announcement(message, shared.clone()).await?;
                     }
                 }
             }
@@ -345,6 +371,42 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn apply_filesystem_paths(
+    state: Arc<RwLock<FolderState>>,
+    rpc_client: &rpc::RpcClient,
+    group: Arc<RwLock<GroupState>>,
+    local_origin: &str,
+    paths: Vec<PathBuf>,
+) {
+    let update = {
+        let mut state = state.write().await;
+        let before_state = state.root_hash();
+        let before_live = state.live_root_hash();
+        let result = if paths.is_empty() {
+            state.rescan()
+        } else {
+            state.apply_paths(paths)
+        };
+        match result {
+            Ok(changes) if changes.is_empty() => None,
+            Ok(changes) => {
+                print_changes(before_state, before_live, &state, &changes);
+                let snapshot = StateSnapshot::from_state(&state);
+                let hint = build_tree_hint(&state, &changes, &snapshot, local_origin);
+                Some((changes, snapshot, hint))
+            }
+            Err(err) => {
+                tracing::warn!("scan failed: {err}");
+                None
+            }
+        }
+    };
+    if let Some((changes, snapshot, hint)) = update {
+        tracing::info!("filesystem changed paths={}", changes.len());
+        publish_filesystem_changed(rpc_client, group, &snapshot, local_origin, hint).await;
     }
 }
 
@@ -542,36 +604,34 @@ async fn publish(
     }
 }
 
-async fn handle_announcement(
-    message: GossipMessage,
-    rpc_client: rpc::RpcClient,
-    state: Arc<RwLock<FolderState>>,
-    group: Arc<RwLock<GroupState>>,
-    root_reports: Arc<RwLock<RootReports>>,
-    downloads: sync::DownloadCoordinator,
-    local_origin: &str,
-) -> io::Result<()> {
-    if message.origin() == local_origin {
+async fn handle_announcement(message: GossipMessage, shared: DaemonShared) -> io::Result<()> {
+    if message.origin() == shared.local_origin {
         return Ok(());
     }
-    if !is_active_origin(&group, message.origin()).await {
+    if !is_active_origin(&shared.group, message.origin()).await {
         tracing::debug!("ignored announcement from non-member {}", message.origin());
         return Ok(());
     }
     if let Some(snapshot) =
-        merge_remote_gc_watermark(Arc::clone(&state), message_gc_watermark(&message)).await
+        merge_remote_gc_watermark(Arc::clone(&shared.state), message_gc_watermark(&message)).await
     {
-        publish_sync_state(&rpc_client, Arc::clone(&group), &snapshot, local_origin).await;
+        publish_sync_state(
+            &shared.publisher,
+            Arc::clone(&shared.group),
+            &snapshot,
+            &shared.local_origin,
+        )
+        .await;
     }
     let local = {
-        let state = state.read().await;
+        let state = shared.state.read().await;
         StateSnapshot::from_state(&state)
     };
     print_remote_message(&message, &local);
-    record_root_report(Arc::clone(&root_reports), &message).await;
+    record_root_report(Arc::clone(&shared.root_reports), &message).await;
     match &message {
         GossipMessage::Peers { members, .. } => {
-            let update = group.write().await.merge_members(members.clone())?;
+            let update = shared.group.write().await.merge_members(members.clone())?;
             if update.changed {
                 tracing::info!("peers updated active={}", update.active_peers.len());
                 if update.removed_self {
@@ -579,26 +639,15 @@ async fn handle_announcement(
                 }
             }
             maybe_gc_tombstones(
-                Arc::clone(&state),
-                Arc::clone(&group),
-                Arc::clone(&root_reports),
-                &rpc_client,
-                local_origin,
+                Arc::clone(&shared.state),
+                Arc::clone(&shared.group),
+                Arc::clone(&shared.root_reports),
+                &shared.publisher,
+                &shared.local_origin,
             )
             .await;
         }
-        _ => maybe_probe_remote_rpc(
-            rpc_client.clone(),
-            message,
-            ProbeShared {
-                state,
-                group: Arc::clone(&group),
-                root_reports,
-                downloads,
-                publisher: rpc_client,
-                local_origin: local_origin.to_string(),
-            },
-        ),
+        _ => maybe_probe_remote_rpc(shared.publisher.clone(), message, shared),
     }
     Ok(())
 }
@@ -757,16 +806,11 @@ fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
     }
 }
 
-struct ProbeShared {
-    state: Arc<RwLock<FolderState>>,
-    group: Arc<RwLock<GroupState>>,
-    root_reports: Arc<RwLock<RootReports>>,
-    downloads: sync::DownloadCoordinator,
-    publisher: rpc::RpcClient,
-    local_origin: String,
-}
-
-fn maybe_probe_remote_rpc(rpc_client: rpc::RpcClient, message: GossipMessage, shared: ProbeShared) {
+fn maybe_probe_remote_rpc(
+    rpc_client: rpc::RpcClient,
+    message: GossipMessage,
+    shared: DaemonShared,
+) {
     let (origin, remote_state_root, remote_live_root, remote_lamport, hint, use_advertised_root) =
         match message {
             GossipMessage::SyncState {
@@ -792,6 +836,7 @@ fn maybe_probe_remote_rpc(rpc_client: rpc::RpcClient, message: GossipMessage, sh
     };
 
     tokio::spawn(async move {
+        let _reconcile = shared.reconcile_gate.lock().await;
         let local = {
             let state = shared.state.read().await;
             StateSnapshot::from_state(&state)
@@ -801,6 +846,7 @@ fn maybe_probe_remote_rpc(rpc_client: rpc::RpcClient, message: GossipMessage, sh
             if remote_state_root == local.state_root && remote_live_root == local.live_root {
                 Ok(None)
             } else if use_advertised_root {
+                shared.sync_activity.begin();
                 match sync::reconcile_with_advertised_root(
                     rpc_client,
                     Arc::clone(&shared.state),
@@ -819,6 +865,7 @@ fn maybe_probe_remote_rpc(rpc_client: rpc::RpcClient, message: GossipMessage, sh
                     Err(err) => Err(err),
                 }
             } else {
+                shared.sync_activity.begin();
                 match sync::reconcile_with_peer(
                     rpc_client,
                     Arc::clone(&shared.state),
@@ -853,8 +900,32 @@ fn maybe_probe_remote_rpc(rpc_client: rpc::RpcClient, message: GossipMessage, sh
             }
             Err(err) => {
                 tracing::warn!("sync peer={} failed: {err}", peer);
-                return;
             }
+        }
+
+        if shared.sync_activity.take_pending_rescan() {
+            tracing::debug!("running deferred filesystem rescan after remote sync");
+            apply_filesystem_paths(
+                Arc::clone(&shared.state),
+                &shared.publisher,
+                Arc::clone(&shared.group),
+                &shared.local_origin,
+                Vec::new(),
+            )
+            .await;
+        }
+        shared.sync_activity.end();
+
+        if shared.sync_activity.take_pending_rescan() {
+            tracing::debug!("running filesystem rescan queued at remote sync boundary");
+            apply_filesystem_paths(
+                Arc::clone(&shared.state),
+                &shared.publisher,
+                Arc::clone(&shared.group),
+                &shared.local_origin,
+                Vec::new(),
+            )
+            .await;
         }
 
         maybe_gc_tombstones(

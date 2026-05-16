@@ -2,7 +2,7 @@ use crate::identity::NodeId;
 use crate::message::TreeHint;
 use crate::rpc::RpcClient;
 use crate::state::{Change, EntryKind, FolderState, TreeNode, entry_hash, hex, tree_node_hash};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,8 +32,25 @@ struct DownloadSlot {
 #[derive(Default)]
 struct DownloadState {
     waiters: usize,
-    claimed: bool,
+    claimed_targets: HashSet<DownloadTarget>,
     result: Option<Result<PathBuf, String>>,
+}
+
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+struct DownloadTarget {
+    path: String,
+    lamport: u64,
+    origin: String,
+}
+
+impl DownloadTarget {
+    fn from_entry(entry: &crate::state::Entry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            lamport: entry.version.lamport,
+            origin: entry.version.origin.clone(),
+        }
+    }
 }
 
 impl DownloadCoordinator {
@@ -47,7 +64,7 @@ impl DownloadCoordinator {
         let slot = Arc::new(DownloadSlot {
             state: Mutex::new(DownloadState {
                 waiters: 1,
-                claimed: false,
+                claimed_targets: HashSet::new(),
                 result: None,
             }),
             notify: Notify::new(),
@@ -56,30 +73,32 @@ impl DownloadCoordinator {
         (slot, true)
     }
 
-    fn claim(slot: &Arc<DownloadSlot>) -> bool {
+    fn claim_target(slot: &Arc<DownloadSlot>, entry: &crate::state::Entry) -> bool {
         let mut state = slot.state.lock().expect("download slot poisoned");
-        if state.claimed {
-            false
-        } else {
-            state.claimed = true;
-            true
-        }
+        state
+            .claimed_targets
+            .insert(DownloadTarget::from_entry(entry))
     }
 
-    fn release(&self, content_hash: [u8; 32], slot: &Arc<DownloadSlot>) {
+    fn release(&self, content_hash: [u8; 32], slot: &Arc<DownloadSlot>) -> Option<PathBuf> {
+        let mut active = self.active.lock().expect("download coordinator poisoned");
         let mut state = slot.state.lock().expect("download slot poisoned");
         state.waiters = state.waiters.saturating_sub(1);
         if state.waiters != 0 {
-            return;
+            return None;
         }
-        drop(state);
-
-        let mut active = self.active.lock().expect("download coordinator poisoned");
+        let shared_tmp = state
+            .result
+            .as_ref()
+            .and_then(|result| result.as_ref().ok().cloned());
         if active
             .get(&content_hash)
             .is_some_and(|active_slot| Arc::ptr_eq(active_slot, slot))
         {
             active.remove(&content_hash);
+            shared_tmp
+        } else {
+            None
         }
     }
 }
@@ -380,24 +399,59 @@ async fn fetch_object_once(
         match result {
             Some(Ok(path)) => break path,
             Some(Err(err)) => {
-                downloads.release(content_hash, &slot);
+                if let Some(path) = downloads.release(content_hash, &slot) {
+                    let _ = tokio::fs::remove_file(path).await;
+                }
                 return Err(io::Error::other(err));
             }
             None => slot.notify.notified().await,
         }
     };
 
-    let claimed = DownloadCoordinator::claim(&slot);
-    downloads.release(content_hash, &slot);
-    if claimed {
-        Ok(Some(shared_tmp_path))
-    } else {
+    if !DownloadCoordinator::claim_target(&slot, entry) {
+        if let Some(path) = downloads.release(content_hash, &slot) {
+            let _ = tokio::fs::remove_file(path).await;
+        }
         tracing::debug!(
-            "download joined in-flight object={} path={} already claimed",
+            "download joined in-flight object={} path={} target already claimed",
             hex(content_hash),
             entry.path
         );
-        Ok(None)
+        return Ok(None);
+    }
+
+    let own_tmp_path = state.read().await.tmp_recv_path(entry);
+    let materialized = materialize_shared_object(&shared_tmp_path, &own_tmp_path).await;
+    if let Some(path) = downloads.release(content_hash, &slot) {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    if materialized.is_err() {
+        let _ = tokio::fs::remove_file(&own_tmp_path).await;
+    }
+    materialized.map(|_| Some(own_tmp_path))
+}
+
+async fn materialize_shared_object(
+    shared_tmp_path: &PathBuf,
+    own_tmp_path: &PathBuf,
+) -> io::Result<()> {
+    match tokio::fs::hard_link(shared_tmp_path, own_tmp_path).await {
+        Ok(()) => Ok(()),
+        Err(link_err) => tokio::fs::copy(shared_tmp_path, own_tmp_path)
+            .await
+            .map(|_| ())
+            .map_err(|copy_err| {
+                io::Error::new(
+                    copy_err.kind(),
+                    format!(
+                        "link {} to {} failed: {}; copy failed: {}",
+                        shared_tmp_path.display(),
+                        own_tmp_path.display(),
+                        link_err,
+                        copy_err
+                    ),
+                )
+            }),
     }
 }
 
@@ -462,11 +516,46 @@ mod tests {
         assert!(first_leader);
         assert!(!second_leader);
         assert!(Arc::ptr_eq(&first, &second));
-        assert!(DownloadCoordinator::claim(&first));
-        assert!(!DownloadCoordinator::claim(&second));
+        let entry = test_entry("same.txt", 1);
+        assert!(DownloadCoordinator::claim_target(&first, &entry));
+        assert!(!DownloadCoordinator::claim_target(&second, &entry));
 
-        coordinator.release(hash, &first);
-        coordinator.release(hash, &second);
+        assert!(coordinator.release(hash, &first).is_none());
+        assert!(coordinator.release(hash, &second).is_none());
         assert!(coordinator.active.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn download_coordinator_allows_same_hash_for_different_targets() {
+        let coordinator = DownloadCoordinator::default();
+        let hash = [7; 32];
+        let (slot, first_leader) = coordinator.acquire(hash);
+
+        assert!(first_leader);
+        assert!(DownloadCoordinator::claim_target(
+            &slot,
+            &test_entry("first.txt", 1)
+        ));
+        assert!(DownloadCoordinator::claim_target(
+            &slot,
+            &test_entry("second.txt", 1)
+        ));
+
+        assert!(coordinator.release(hash, &slot).is_none());
+    }
+
+    fn test_entry(path: &str, lamport: u64) -> crate::state::Entry {
+        crate::state::Entry {
+            path: path.to_string(),
+            kind: EntryKind::File,
+            content_hash: Some([7; 32]),
+            symlink_target: None,
+            size: 1,
+            mode: None,
+            version: crate::state::Version {
+                lamport,
+                origin: "node-a".to_string(),
+            },
+        }
     }
 }

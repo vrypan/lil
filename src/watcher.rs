@@ -6,6 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
+const IGNORED_DIR_NAMES: &[&str] = &[".lil"];
+
 pub fn spawn(
     root: PathBuf,
     debounce_ms: u64,
@@ -46,9 +48,12 @@ fn spawn_watcher(
                     tracing::debug!("filesystem event: {:?}", event.kind);
                     let mut paths = event.paths;
                     drain_debounce_window(&watch_rx, debounce, &mut paths);
+                    paths.retain(|path| !is_ignored_event_path(path));
                     paths.sort();
                     paths.dedup();
-                    let _ = tx.send(paths);
+                    if !paths.is_empty() {
+                        let _ = tx.send(paths);
+                    }
                 }
                 Err(err) => tracing::warn!("filesystem watch error: {err}"),
             }
@@ -80,6 +85,13 @@ fn drain_debounce_window(
     }
 }
 
+fn is_ignored_event_path(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        IGNORED_DIR_NAMES.contains(&name.as_ref())
+    })
+}
+
 fn run_polling(interval_ms: u64, tx: UnboundedSender<Vec<PathBuf>>) {
     let interval = Duration::from_millis(interval_ms.max(50));
     loop {
@@ -87,5 +99,20 @@ fn run_polling(interval_ms: u64, tx: UnboundedSender<Vec<PathBuf>>) {
         if tx.send(Vec::new()).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn ignores_state_dir_events() {
+        assert!(is_ignored_event_path(Path::new(
+            "/tmp/root/.lil/entries.bin"
+        )));
+        assert!(is_ignored_event_path(Path::new(".lil/recv-file")));
+        assert!(!is_ignored_event_path(Path::new("/tmp/root/file.txt")));
     }
 }
