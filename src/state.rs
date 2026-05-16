@@ -284,7 +284,7 @@ impl FolderState {
                 self.install_remote_file(&remote, tmp)?;
             }
             EntryKind::Dir => {
-                install_remote_dir(&self.root.join(&remote.path))?;
+                self.install_remote_dir(&remote)?;
             }
             EntryKind::Symlink => {
                 self.install_remote_symlink(&remote)?;
@@ -335,6 +335,12 @@ impl FolderState {
         }
 
         Ok(())
+    }
+
+    fn install_remote_dir(&self, remote: &Entry) -> io::Result<()> {
+        let dest = self.root.join(&remote.path);
+        install_remote_dir(&dest)?;
+        set_mode(&dest, remote.mode)
     }
 
     fn install_remote_symlink(&self, remote: &Entry) -> io::Result<()> {
@@ -740,6 +746,20 @@ fn install_remote_dir(path: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path),
         Err(err) => Err(err),
     }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: Option<u32>) -> io::Result<()> {
+    let Some(mode) = mode else {
+        return Ok(());
+    };
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: Option<u32>) -> io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1687,6 +1707,40 @@ mod tests {
             PathBuf::from("target.txt")
         );
         assert_eq!(state.entry("link.txt").unwrap().version.lamport, 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applies_remote_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("remote-dir")).unwrap();
+        fs::set_permissions(
+            tmp.path().join("remote-dir"),
+            fs::Permissions::from_mode(0o775),
+        )
+        .unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let remote = Entry {
+            path: "remote-dir".to_string(),
+            kind: EntryKind::Dir,
+            content_hash: None,
+            symlink_target: None,
+            size: 0,
+            mode: Some(0o40755),
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        state.apply_remote_entry(remote, None).unwrap().unwrap();
+
+        let metadata = fs::symlink_metadata(tmp.path().join("remote-dir")).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+        assert!(state.rescan().unwrap().is_empty());
+        assert_eq!(state.entry("remote-dir").unwrap().version.lamport, 10);
     }
 
     #[cfg(unix)]
