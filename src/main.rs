@@ -91,14 +91,7 @@ async fn run(cli: Cli) -> io::Result<()> {
             let address_book = discovery::new_address_book();
             let _mdns = discovery::spawn_browser(identity.node_id(), Arc::clone(&address_book))?;
             let peers_path = state_dir.join(PEERS_FILE);
-            join_group(
-                Arc::clone(&identity),
-                address_book,
-                &peers_path,
-                &ticket,
-                name.clone(),
-            )
-            .await?;
+            join_group(Arc::clone(&identity), address_book, &peers_path, &ticket).await?;
             if exit {
                 return Ok(());
             }

@@ -22,8 +22,6 @@ pub struct MemberEntry {
     pub id: String,
     pub status: MemberStatus,
     pub lamport: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,7 +47,7 @@ pub struct MemberMerge {
 }
 
 impl GroupState {
-    pub fn load_or_init(path: PathBuf, local_id: NodeId, name: Option<String>) -> io::Result<Self> {
+    pub fn load_or_init(path: PathBuf, local_id: NodeId) -> io::Result<Self> {
         let local_id = local_id.to_string();
         let loaded = match fs::read_to_string(&path) {
             Ok(contents) => Some(serde_json::from_str::<PeersFile>(&contents).map_err(|err| {
@@ -68,26 +66,16 @@ impl GroupState {
             })
             .unwrap_or_default();
 
-        let has_local = members.contains_key(&local_id);
-        let local_name = members.get(&local_id).and_then(|e| e.name.clone());
-        let name_changed = name.is_some() && local_name != name;
-        if !has_local || name_changed {
+        if !members.contains_key(&local_id) {
             let lamport = next_lamport(&members);
-            if !has_local {
-                members.insert(
-                    local_id.clone(),
-                    MemberEntry {
-                        id: local_id.clone(),
-                        name,
-                        status: MemberStatus::Active,
-                        lamport,
-                    },
-                );
-            } else {
-                let entry = members.get_mut(&local_id).unwrap();
-                entry.name = name;
-                entry.lamport = lamport;
-            }
+            members.insert(
+                local_id.clone(),
+                MemberEntry {
+                    id: local_id.clone(),
+                    status: MemberStatus::Active,
+                    lamport,
+                },
+            );
         }
 
         let state = Self {
@@ -130,21 +118,13 @@ impl GroupState {
         self.members.contains_key(&peer.to_string())
     }
 
-    pub fn add_active_peer(&mut self, peer: NodeId, name: Option<String>) -> io::Result<bool> {
+    pub fn add_active_peer(&mut self, peer: NodeId) -> io::Result<bool> {
         let id = peer.to_string();
         let lamport = next_lamport(&self.members);
         let changed = match self.members.get_mut(&id) {
-            Some(entry)
-                if entry.status == MemberStatus::Active
-                    && (name.is_none() || entry.name == name) =>
-            {
-                false
-            }
+            Some(entry) if entry.status == MemberStatus::Active => false,
             Some(entry) => {
                 entry.status = MemberStatus::Active;
-                if name.is_some() {
-                    entry.name = name;
-                }
                 entry.lamport = lamport;
                 true
             }
@@ -153,7 +133,6 @@ impl GroupState {
                     id.clone(),
                     MemberEntry {
                         id,
-                        name,
                         status: MemberStatus::Active,
                         lamport,
                     },
@@ -171,7 +150,7 @@ impl GroupState {
         let id = self
             .members
             .values()
-            .find(|e| e.id == target || e.name.as_deref() == Some(target))
+            .find(|e| e.id == target)
             .map(|e| e.id.clone());
 
         let Some(id) = id else {
@@ -353,14 +332,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let local = node(1);
         let peer = node(2);
-        let mut state =
-            GroupState::load_or_init(tmp.path().join("peers.json"), local, None).unwrap();
+        let mut state = GroupState::load_or_init(tmp.path().join("peers.json"), local).unwrap();
 
         let peer_id = peer.to_string();
         let update = state
             .merge_members(vec![MemberEntry {
                 id: peer_id.clone(),
-                name: None,
                 status: MemberStatus::Active,
                 lamport: 2,
             }])
@@ -371,7 +348,6 @@ mod tests {
         let update = state
             .merge_members(vec![MemberEntry {
                 id: peer_id,
-                name: None,
                 status: MemberStatus::Removed,
                 lamport: 1,
             }])
@@ -381,66 +357,21 @@ mod tests {
     }
 
     #[test]
-    fn name_propagates_via_load_or_init() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = node(1);
-        let path = tmp.path().join("peers.json");
-
-        GroupState::load_or_init(path.clone(), local, Some("alice".to_string())).unwrap();
-        let state = GroupState::load_or_init(path, local, None).unwrap();
-
-        let entry = state
-            .members()
-            .into_iter()
-            .find(|e| e.id == local.to_string())
-            .unwrap();
-        assert_eq!(entry.name.as_deref(), Some("alice"));
-    }
-
-    #[test]
-    fn name_update_bumps_lamport() {
-        let tmp = tempfile::tempdir().unwrap();
-        let local = node(1);
-        let path = tmp.path().join("peers.json");
-
-        let s1 = GroupState::load_or_init(path.clone(), local, Some("alice".to_string())).unwrap();
-        let lamport1 = s1
-            .members()
-            .into_iter()
-            .find(|e| e.id == local.to_string())
-            .unwrap()
-            .lamport;
-
-        let s2 = GroupState::load_or_init(path, local, Some("bob".to_string())).unwrap();
-        let entry2 = s2
-            .members()
-            .into_iter()
-            .find(|e| e.id == local.to_string())
-            .unwrap();
-        assert_eq!(entry2.name.as_deref(), Some("bob"));
-        assert!(entry2.lamport > lamport1);
-    }
-
-    #[test]
-    fn remove_peer_by_id_and_by_name() {
+    fn remove_peer_by_id() {
         let tmp = tempfile::tempdir().unwrap();
         let local = node(1);
         let peer = node(2);
         let path = tmp.path().join("peers.json");
-        let mut state = GroupState::load_or_init(path, local, None).unwrap();
+        let mut state = GroupState::load_or_init(path, local).unwrap();
 
-        state
-            .add_active_peer(peer, Some("carol".to_string()))
-            .unwrap();
+        state.add_active_peer(peer).unwrap();
         assert!(state.is_active_member(&peer));
 
-        // remove by name
-        let removed = state.remove_peer("carol").unwrap();
+        let removed = state.remove_peer(&peer.to_string()).unwrap();
         assert_eq!(removed.as_deref(), Some(peer.to_string().as_str()));
         assert!(!state.is_active_member(&peer));
 
-        // removing again returns None (already removed, but still finds the entry)
-        state.add_active_peer(peer, None).unwrap();
+        state.add_active_peer(peer).unwrap();
         let removed = state.remove_peer(&peer.to_string()).unwrap();
         assert!(removed.is_some());
     }
@@ -450,7 +381,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let local = node(1);
         let path = tmp.path().join("peers.json");
-        let mut state = GroupState::load_or_init(path, local, None).unwrap();
+        let mut state = GroupState::load_or_init(path, local).unwrap();
         assert!(state.remove_peer(&local.to_string()).is_err());
     }
 }

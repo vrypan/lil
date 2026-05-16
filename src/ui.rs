@@ -127,7 +127,10 @@ pub async fn render_status_view(
         let online = peer.is_some_and(|peer| addresses.contains_key(&peer));
         let is_syncing = peer.is_some_and(|peer| syncing_peer == Some(peer));
         let synced = reports.is_synced(&member.id, &local);
-        let label = member.name.as_deref().unwrap_or(&member.id);
+        let label = peer
+            .and_then(|p| addresses.get(&p))
+            .and_then(|info| info.name.as_deref())
+            .unwrap_or(&member.id);
         let status_text = if !online {
             "offline".to_string()
         } else if is_syncing || !synced {

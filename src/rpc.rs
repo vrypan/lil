@@ -35,7 +35,6 @@ fn next_request_id() -> u64 {
 pub enum RpcEvent {
     PeerJoined {
         peer: NodeId,
-        name: Option<String>,
     },
     Announcement {
         peer: NodeId,
@@ -196,14 +195,12 @@ impl RpcClient {
         peer: NodeId,
         secret: String,
         joiner_id: NodeId,
-        name: Option<String>,
     ) -> io::Result<Vec<MemberEntry>> {
         let request_id = next_request_id();
         let request = RequestMessage::Join {
             request_id,
             secret,
             joiner_id: joiner_id.to_string(),
-            name,
         };
         match self.round_trip(peer, request).await? {
             ResponseMessage::JoinAccepted {
@@ -285,7 +282,7 @@ impl RpcClient {
     async fn wait_for_addr(&self, peer: NodeId) -> io::Result<SocketAddr> {
         let deadline = Instant::now() + DISCOVERY_TIMEOUT;
         loop {
-            if let Some(addr) = self.addresses.read().await.get(&peer).copied() {
+            if let Some(addr) = self.addresses.read().await.get(&peer).map(|i| i.addr) {
                 return Ok(addr);
             }
             if Instant::now() >= deadline {
@@ -466,7 +463,6 @@ async fn handle_request(
             request_id,
             secret,
             joiner_id,
-            name,
         } => {
             if joiner_id != peer.to_string() {
                 return ResponseMessage::JoinRejected {
@@ -477,9 +473,9 @@ async fn handle_request(
             match group::consume_invite(invites_path, &secret) {
                 Ok(true) => {
                     let mut group = group.write().await;
-                    match group.add_active_peer(peer, name.clone()) {
+                    match group.add_active_peer(peer) {
                         Ok(_) => {
-                            let _ = events.send(RpcEvent::PeerJoined { peer, name });
+                            let _ = events.send(RpcEvent::PeerJoined { peer });
                             ResponseMessage::JoinAccepted {
                                 request_id,
                                 members: group.members(),

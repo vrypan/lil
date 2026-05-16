@@ -101,7 +101,6 @@ struct PeerPublishMarker {
     id: String,
     status: MemberStatus,
     lamport: u64,
-    name: Option<String>,
 }
 
 impl PublishTracker {
@@ -139,7 +138,6 @@ fn peer_publish_marker(members: &[MemberEntry]) -> Vec<PeerPublishMarker> {
             id: member.id.clone(),
             status: member.status.clone(),
             lamport: member.lamport,
-            name: member.name.clone(),
         })
         .collect()
 }
@@ -202,9 +200,7 @@ pub async fn run_sync(
     let local_origin = local_id.to_string();
     let peers_path = state_dir.join(PEERS_FILE);
     let invites_path = state_dir.join(INVITES_FILE);
-    let group = Arc::new(RwLock::new(GroupState::load_or_init(
-        peers_path, local_id, name,
-    )?));
+    let group = Arc::new(RwLock::new(GroupState::load_or_init(peers_path, local_id)?));
     let bootstrap = group.read().await.active_peers();
     let state = {
         let s = FolderState::new(folder.clone(), local_origin.clone())?;
@@ -230,7 +226,12 @@ pub async fn run_sync(
         rpc_event_tx,
     )
     .await?;
-    let mdns = crate::discovery::spawn(local_id, rpc_port, Arc::clone(&address_book))?;
+    let mdns = crate::discovery::spawn(
+        local_id,
+        rpc_port,
+        name.as_deref(),
+        Arc::clone(&address_book),
+    )?;
     let rpc_client = RpcClient::new(Arc::clone(&identity), Arc::clone(&address_book));
     let shared = DaemonShared {
         state: Arc::clone(&state),
@@ -325,11 +326,8 @@ pub async fn run_sync(
             }
             Some(event) = rpc_event_rx.recv() => {
                 match event {
-                    rpc::RpcEvent::PeerJoined { peer, name } => {
-                        match name.as_deref() {
-                            Some(n) => tracing::info!("peer joined {peer} ({n})"),
-                            None    => tracing::info!("peer joined {peer}"),
-                        };
+                    rpc::RpcEvent::PeerJoined { peer } => {
+                        tracing::info!("peer joined {peer}");
                         publish_peers(&rpc_client, Arc::clone(&group), &local_origin).await;
                     }
                     rpc::RpcEvent::Announcement { peer, message } => {

@@ -1,5 +1,6 @@
-//! mDNS-based peer discovery: advertises this node's RPC port on the local
-//! network and maintains an address book mapping `NodeId` to `SocketAddr`.
+//! mDNS-based peer discovery: advertises this node's RPC port (and optional
+//! human-readable name) on the local network and maintains an address book
+//! mapping `NodeId` to `PeerInfo`.
 
 use crate::identity::NodeId;
 use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo, UnregisterStatus};
@@ -12,7 +13,13 @@ use tokio::sync::RwLock;
 
 pub const SERVICE_TYPE: &str = "_lilsync._tcp.local.";
 
-pub type AddressBook = Arc<RwLock<HashMap<NodeId, SocketAddr>>>;
+#[derive(Debug, Clone)]
+pub struct PeerInfo {
+    pub addr: SocketAddr,
+    pub name: Option<String>,
+}
+
+pub type AddressBook = Arc<RwLock<HashMap<NodeId, PeerInfo>>>;
 
 pub fn new_address_book() -> AddressBook {
     Arc::new(RwLock::new(HashMap::new()))
@@ -54,12 +61,20 @@ impl MdnsHandle {
     }
 }
 
-pub fn spawn(local_id: NodeId, port: u16, address_book: AddressBook) -> io::Result<MdnsHandle> {
+pub fn spawn(
+    local_id: NodeId,
+    port: u16,
+    name: Option<&str>,
+    address_book: AddressBook,
+) -> io::Result<MdnsHandle> {
     let mdns = ServiceDaemon::new().map_err(io::Error::other)?;
     let instance = format!("lilsync-{}", &local_id.to_string()[..12]);
     let host = format!("{instance}.local.");
     let mut props = HashMap::new();
     props.insert("id".to_string(), local_id.to_string());
+    if let Some(n) = name {
+        props.insert("name".to_string(), n.to_string());
+    }
     let service = ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", port, props)
         .map_err(io::Error::other)?
         .enable_addr_auto();
@@ -104,9 +119,13 @@ fn spawn_browser_task(
                     let Some(addr) = best_addr(&info.addresses, info.port) else {
                         continue;
                     };
+                    let name = info.get_property_val_str("name").map(|s| s.to_string());
                     services.insert(info.get_fullname().to_string(), id);
                     tracing::debug!("mdns resolved {id} at {addr}");
-                    address_book.write().await.insert(id, addr);
+                    address_book
+                        .write()
+                        .await
+                        .insert(id, PeerInfo { addr, name });
                 }
                 ServiceEvent::ServiceRemoved(_, fullname) => {
                     if let Some(id) = services.remove(&fullname) {

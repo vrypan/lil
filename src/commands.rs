@@ -20,7 +20,7 @@ pub fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
     let identity = Identity::load_or_create(&state_dir.join(KEY_FILE))?;
     let node_id = identity.node_id();
     let peers_path = state_dir.join(PEERS_FILE);
-    let _group = GroupState::load_or_init(peers_path, node_id, None)?;
+    let _group = GroupState::load_or_init(peers_path, node_id)?;
     let secret_bytes = generate_secret()?;
     let secret_hex = hex(secret_bytes);
     let expires_at = now_ms()? + expire_secs.saturating_mul(1000);
@@ -34,18 +34,14 @@ pub fn peers_cmd(state_dir: &Path) -> io::Result<()> {
     let identity = Identity::load_or_create(&state_dir.join(KEY_FILE))?;
     let node_id = identity.node_id();
     let peers_path = state_dir.join(PEERS_FILE);
-    let group = GroupState::load_or_init(peers_path, node_id, None)?;
+    let group = GroupState::load_or_init(peers_path, node_id)?;
     for member in group.members() {
-        let label = match member.name.as_deref() {
-            Some(n) => format!("{} ({})", member.id, n),
-            None => member.id.clone(),
-        };
         let marker = if member.id == node_id.to_string() {
             " [self]"
         } else {
             ""
         };
-        println!("{:?} {}{}", member.status, label, marker);
+        println!("{:?} {}{}", member.status, member.id, marker);
     }
     Ok(())
 }
@@ -103,7 +99,7 @@ pub fn remove_peer_cmd(state_dir: &Path, target: &str) -> io::Result<()> {
     let identity = Identity::load_or_create(&state_dir.join(KEY_FILE))?;
     let node_id = identity.node_id();
     let peers_path = state_dir.join(PEERS_FILE);
-    let mut group = GroupState::load_or_init(peers_path, node_id, None)?;
+    let mut group = GroupState::load_or_init(peers_path, node_id)?;
     match group.remove_peer(target)? {
         Some(id) => {
             println!("removed {id}");
@@ -122,12 +118,11 @@ pub async fn join_group(
     address_book: AddressBook,
     peers_path: &Path,
     ticket: &str,
-    name: Option<String>,
 ) -> io::Result<()> {
     let ticket = parse_join_ticket(ticket)?;
     let rpc_client = RpcClient::new(Arc::clone(&identity), address_book);
     let members = rpc_client
-        .join_group(ticket.issuer, ticket.secret, identity.node_id(), name)
+        .join_group(ticket.issuer, ticket.secret, identity.node_id())
         .await?;
     GroupState::replace(peers_path, members)?;
     tracing::info!("joined group via {}", ticket.issuer);
