@@ -7,14 +7,21 @@ use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, PublicKey};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::time::{Duration, Instant, timeout};
 
 pub const ALPN: &[u8] = b"lil/rpc/1";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const OBJECT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const OBJECT_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -57,7 +64,13 @@ impl FolderRpc {
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     endpoint: Endpoint,
-    connections: Arc<Mutex<HashMap<PublicKey, Connection>>>,
+    connections: Arc<Mutex<HashMap<PublicKey, CachedConnection>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedConnection {
+    connection: Connection,
+    created_at: Instant,
 }
 
 impl RpcClient {
@@ -215,32 +228,59 @@ impl RpcClient {
         request: RequestMessage,
     ) -> io::Result<ResponseMessage> {
         let connection = self.connection(peer).await?;
-        match round_trip_on_connection(&connection, peer, &request).await {
+        match rpc_timeout(
+            REQUEST_TIMEOUT,
+            "RPC request",
+            peer,
+            round_trip_on_connection(&connection, peer, &request),
+        )
+        .await
+        .and_then(|result| result)
+        {
             Ok(response) => Ok(response),
             Err(first_err) => {
                 self.drop_connection(peer).await;
                 tracing::debug!(target: "lil::rpc", %peer, "retrying RPC after connection error: {first_err}");
                 let connection = self.connection(peer).await?;
-                round_trip_on_connection(&connection, peer, &request).await
+                rpc_timeout(
+                    REQUEST_TIMEOUT,
+                    "RPC request retry",
+                    peer,
+                    round_trip_on_connection(&connection, peer, &request),
+                )
+                .await
+                .and_then(|result| result)
             }
         }
     }
 
     async fn connection(&self, peer: PublicKey) -> io::Result<Connection> {
-        let mut connections = self.connections.lock().await;
-        if let Some(connection) = connections.get(&peer) {
-            if connection.close_reason().is_none() {
-                return Ok(connection.clone());
+        {
+            let mut connections = self.connections.lock().await;
+            if let Some(cached) = connections.get(&peer) {
+                let stale = cached.connection.close_reason().is_some()
+                    || cached.created_at.elapsed() > MAX_CONNECTION_AGE;
+                if !stale {
+                    return Ok(cached.connection.clone());
+                }
+                tracing::debug!(target: "lil::rpc", %peer, "dropping stale cached connection");
+                connections.remove(&peer);
             }
-            connections.remove(&peer);
         }
 
-        let connection = self
-            .endpoint
-            .connect(peer, ALPN)
-            .await
-            .map_err(|err| io::Error::other(format!("connect to {peer}: {err}")))?;
-        connections.insert(peer, connection.clone());
+        let connection = rpc_timeout(
+            CONNECT_TIMEOUT,
+            "connect",
+            peer,
+            self.endpoint.connect(peer, ALPN),
+        )
+        .await?
+        .map_err(|err| io::Error::other(format!("connect to {peer}: {err}")))?;
+        let cached = CachedConnection {
+            connection: connection.clone(),
+            created_at: Instant::now(),
+        };
+        self.connections.lock().await.insert(peer, cached);
         Ok(connection)
     }
 
@@ -490,21 +530,40 @@ async fn get_object_to_file_on_connection(
     expected_size: u64,
     dest: &Path,
 ) -> io::Result<()> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|err| io::Error::other(format!("open stream to {peer}: {err}")))?;
+    let (mut send, mut recv) = rpc_timeout(
+        REQUEST_TIMEOUT,
+        "open object stream",
+        peer,
+        connection.open_bi(),
+    )
+    .await?
+    .map_err(|err| io::Error::other(format!("open stream to {peer}: {err}")))?;
 
-    write_frame(&mut send, request)
-        .await
-        .map_err(|err| io::Error::other(format!("write request to {peer}: {err}")))?;
-    close_send(&mut send)
-        .await
-        .map_err(|err| io::Error::other(format!("close request stream to {peer}: {err}")))?;
+    rpc_timeout(
+        REQUEST_TIMEOUT,
+        "write object request",
+        peer,
+        write_frame(&mut send, request),
+    )
+    .await?
+    .map_err(|err| io::Error::other(format!("write request to {peer}: {err}")))?;
+    rpc_timeout(
+        REQUEST_TIMEOUT,
+        "close object request stream",
+        peer,
+        close_send(&mut send),
+    )
+    .await?
+    .map_err(|err| io::Error::other(format!("close request stream to {peer}: {err}")))?;
 
-    let header: ResponseMessage = read_frame(&mut recv)
-        .await
-        .map_err(|err| io::Error::other(format!("read object header from {peer}: {err}")))?;
+    let header: ResponseMessage = rpc_timeout(
+        OBJECT_HEADER_TIMEOUT,
+        "read object header",
+        peer,
+        read_frame(&mut recv),
+    )
+    .await?
+    .map_err(|err| io::Error::other(format!("read object header from {peer}: {err}")))?;
 
     let size = match header {
         ResponseMessage::ObjectHeader {
@@ -528,19 +587,25 @@ async fn get_object_to_file_on_connection(
         )));
     }
 
-    let result = stream_to_file(&mut recv, size, expected_hash, dest).await;
+    let result = stream_to_file(peer, &mut recv, size, expected_hash, dest).await;
     if result.is_err() {
         let _ = tokio::fs::remove_file(dest).await;
     }
     result?;
 
-    assert_eof(&mut recv)
-        .await
-        .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
+    rpc_timeout(
+        REQUEST_TIMEOUT,
+        "read trailing object bytes",
+        peer,
+        assert_eof(&mut recv),
+    )
+    .await?
+    .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
     Ok(())
 }
 
 async fn stream_to_file(
+    peer: PublicKey,
     recv: &mut iroh::endpoint::RecvStream,
     size: u64,
     expected_hash: [u8; 32],
@@ -553,9 +618,17 @@ async fn stream_to_file(
 
     while remaining > 0 {
         let to_read = (remaining as usize).min(buf.len());
-        let n = recv
-            .read(&mut buf[..to_read])
+        let n = timeout(OBJECT_READ_IDLE_TIMEOUT, recv.read(&mut buf[..to_read]))
             .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "object transfer from {peer} idle for {}s",
+                        OBJECT_READ_IDLE_TIMEOUT.as_secs()
+                    ),
+                )
+            })?
             .map_err(io::Error::other)?
             .ok_or_else(|| io::Error::other("unexpected EOF during object transfer"))?;
         hasher.update(&buf[..n]);
@@ -577,9 +650,44 @@ async fn stream_to_file(
     Ok(())
 }
 
+async fn rpc_timeout<T>(
+    duration: Duration,
+    operation: &str,
+    peer: PublicKey,
+    future: impl Future<Output = T>,
+) -> io::Result<T> {
+    timeout(duration, future).await.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{operation} timed out after {}s for peer {peer}",
+                duration.as_secs()
+            ),
+        )
+    })
+}
+
 fn is_routine_connection_close(err: &ConnectionError) -> bool {
     matches!(
         err,
         ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rpc_timeout_returns_timed_out_error() {
+        let peer = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let err = rpc_timeout(Duration::from_millis(1), "test operation", peer, async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(err.to_string().contains("test operation timed out"));
+    }
 }
