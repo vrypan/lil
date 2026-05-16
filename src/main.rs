@@ -125,14 +125,30 @@ async fn run(cli: Cli) -> io::Result<()> {
             }
             run_sync(folder, name, false, 500, 10, status).await?;
         }
-        Command::Sync {
+        Command::Start {
+            folder,
+            name,
+            poll,
+            interval_ms,
+            announce_interval_secs,
+        } => {
+            run_sync(
+                folder,
+                name,
+                poll,
+                interval_ms,
+                announce_interval_secs,
+                false,
+            )
+            .await?
+        }
+        Command::Watch {
             folder,
             name,
             poll,
             interval_ms,
             announce_interval_secs,
             status,
-            daemon: _,
         } => {
             run_sync(
                 folder,

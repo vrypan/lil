@@ -17,11 +17,7 @@ pub struct Cli {
 impl Cli {
     pub fn daemon_log_path(&self) -> Option<std::path::PathBuf> {
         match &self.command {
-            Command::Sync {
-                folder,
-                daemon: true,
-                ..
-            } => Some(folder.join(".lil").join("sync.log")),
+            Command::Start { folder, .. } => Some(folder.join(".lil").join("sync.log")),
             _ => None,
         }
     }
@@ -29,7 +25,7 @@ impl Cli {
     pub fn status_mode(&self) -> bool {
         matches!(
             self.command,
-            Command::Sync { status: true, .. }
+            Command::Watch { status: true, .. }
                 | Command::Join {
                     status: true,
                     exit: false,
@@ -41,9 +37,26 @@ impl Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Run the sync daemon for a folder
-    Sync {
-        /// Folder to monitor
+    /// Start the sync daemon in the background
+    Start {
+        /// Folder to sync
+        folder: PathBuf,
+        /// Human-readable name for this node
+        #[arg(long)]
+        name: Option<String>,
+        /// Use periodic polling instead of filesystem events
+        #[arg(long)]
+        poll: bool,
+        /// Debounce delay for filesystem events, or scan interval with --poll
+        #[arg(long, value_name = "MILLIS", default_value = "500")]
+        interval_ms: u64,
+        /// How often to publish local root state
+        #[arg(long, value_name = "SECONDS", default_value = "10")]
+        announce_interval_secs: u64,
+    },
+    /// Run the sync daemon in the foreground
+    Watch {
+        /// Folder to sync
         folder: PathBuf,
         /// Human-readable name for this node
         #[arg(long)]
@@ -60,9 +73,6 @@ pub enum Command {
         /// Show a quiet peer status view instead of regular info logs
         #[arg(long)]
         status: bool,
-        /// Fork into the background and write logs to <folder>/.lil/sync.log
-        #[arg(long)]
-        daemon: bool,
     },
     /// Create a one-time join ticket and exit
     Invite {

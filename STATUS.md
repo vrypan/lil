@@ -28,7 +28,7 @@ Degree: functional. The structure is a directory trie, not a compressed radix tr
 
 ### Folder Monitoring
 
-- `lil sync <path>` monitors a folder and logs local tree changes.
+- `lil start <path>` / `lil watch <path>` monitors a folder and logs local tree changes.
 - Native filesystem notifications are used by default through `notify`.
 - `--poll` is available as a fallback.
 - Changes are debounced by `--interval-ms`.
@@ -161,11 +161,30 @@ cargo clippy --all-targets -- -D warnings
 
 ## Current Usage
 
-Start syncing a folder (creates a new group on first run):
+Start the daemon in the background (creates a new group on first run):
 
 ```text
-lil sync ./tmp1
-lil sync ./tmp1 --name alice --poll
+lil start ./tmp1
+lil start ./tmp1 --name alice --poll
+```
+
+Run in the foreground (useful for debugging):
+
+```text
+lil watch ./tmp1
+lil watch ./tmp1 --status
+```
+
+Stop the background daemon:
+
+```text
+lil stop ./tmp1
+```
+
+Show local state and peer list (no running daemon required):
+
+```text
+lil status ./tmp1
 ```
 
 Create an invite:
@@ -174,16 +193,17 @@ Create an invite:
 lil invite ./tmp1 --expire-secs 3600
 ```
 
-Join from another folder (starts the daemon after a successful join):
+Join from another folder (runs `watch` after a successful join):
 
 ```text
 lil join ./tmp2 <86-char-base62-ticket>
 ```
 
-Join from another folder and exit so a service can start the daemon later:
+Join and exit so a service manager can start the daemon:
 
 ```text
 lil join ./tmp2 <86-char-base62-ticket> --exit
+lil start ./tmp2
 ```
 
 List known peers:
@@ -192,8 +212,8 @@ List known peers:
 lil peers ./tmp1
 ```
 
-Remove a peer by ID or name:
+Remove a peer by ID:
 
 ```text
-lil remove ./tmp1 <id-or-name>
+lil remove ./tmp1 <id>
 ```
