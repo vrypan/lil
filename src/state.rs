@@ -683,6 +683,10 @@ fn load_saved_entries(state_dir: &Path) -> BTreeMap<String, Entry> {
         .unwrap_or_default()
 }
 
+pub fn load_stored_entries(root: &Path) -> io::Result<BTreeMap<String, Entry>> {
+    Ok(load_saved_entries(&root.join(STATE_DIR)))
+}
+
 fn cleanup_recv_files(state_dir: &Path) {
     let Ok(entries) = fs::read_dir(state_dir) else {
         return;

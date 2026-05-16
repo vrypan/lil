@@ -13,7 +13,7 @@ use crate::discovery::AddressBook;
 use crate::group::GroupState;
 use crate::identity::{Identity, NodeId};
 use crate::message::{GossipMessage, TreeHint};
-use crate::state::{Change, FolderState, GcWatermark, hex};
+use crate::state::{Change, Entry, EntryKind, FolderState, GcWatermark, hex};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeSet;
 use std::fs;
@@ -130,6 +130,14 @@ enum Command {
         /// Folder whose group to inspect
         folder: PathBuf,
     },
+    /// Dump stored sync state entries as JSON lines
+    DumpState {
+        /// Folder whose .lil state to inspect
+        folder: PathBuf,
+        /// Only include this path or descendants
+        #[arg(long)]
+        prefix: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +187,9 @@ async fn run() -> io::Result<()> {
             let state_dir = folder.join(".lil");
             fs::create_dir_all(&state_dir)?;
             return peers_cmd(&state_dir);
+        }
+        Command::DumpState { folder, prefix } => {
+            return dump_state_cmd(&folder, prefix.as_deref());
         }
         Command::Join {
             folder,
@@ -1054,6 +1065,55 @@ fn peers_cmd(state_dir: &Path) -> io::Result<()> {
         println!("{:?} {}{}", member.status, label, marker);
     }
     Ok(())
+}
+
+fn dump_state_cmd(folder: &Path, prefix: Option<&str>) -> io::Result<()> {
+    let entries = state::load_stored_entries(folder)?;
+    let prefix = prefix
+        .map(|p| p.trim_matches('/'))
+        .filter(|p| !p.is_empty());
+    for entry in entries
+        .values()
+        .filter(|entry| entry_matches_prefix(entry, prefix))
+    {
+        println!("{}", entry_dump_json(entry)?);
+    }
+    Ok(())
+}
+
+fn entry_matches_prefix(entry: &Entry, prefix: Option<&str>) -> bool {
+    let Some(prefix) = prefix else {
+        return true;
+    };
+    entry.path == prefix
+        || entry
+            .path
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn entry_dump_json(entry: &Entry) -> io::Result<String> {
+    let hash = entry.content_hash.map(hex);
+    serde_json::to_string(&serde_json::json!({
+        "path": entry.path,
+        "kind": entry_kind_name(entry.kind),
+        "hash": hash,
+        "target": entry.symlink_target,
+        "size": entry.size,
+        "mode": entry.mode,
+        "lamport": entry.version.lamport,
+        "origin": entry.version.origin,
+    }))
+    .map_err(io::Error::other)
+}
+
+fn entry_kind_name(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::File => "file",
+        EntryKind::Dir => "dir",
+        EntryKind::Tombstone => "tombstone",
+        EntryKind::Symlink => "symlink",
+    }
 }
 
 fn remove_peer_cmd(state_dir: &Path, target: &str) -> io::Result<()> {
