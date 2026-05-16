@@ -100,6 +100,11 @@ pub enum Command {
         /// Folder whose group to inspect
         folder: PathBuf,
     },
+    /// Show local sync state and peer list
+    Status {
+        /// Folder to inspect
+        folder: PathBuf,
+    },
     /// Stop a running daemon
     Stop {
         /// Folder whose daemon to stop

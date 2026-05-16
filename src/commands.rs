@@ -7,6 +7,7 @@ use crate::group::{GroupState, add_invite, generate_secret, now_ms};
 use crate::identity::Identity;
 use crate::rpc::RpcClient;
 use crate::state::{Entry, EntryKind, hex, load_stored_entries};
+use crate::tree::derive_tree;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -45,6 +46,78 @@ pub fn peers_cmd(state_dir: &Path) -> io::Result<()> {
         println!("{:?} {}{}", member.status, member.id, marker);
     }
     Ok(())
+}
+
+pub fn status_cmd(folder: &Path) -> io::Result<()> {
+    let state_dir = folder.join(".lil");
+
+    println!("daemon    {}", daemon_running_status(&state_dir));
+
+    let entries = load_stored_entries(folder)?;
+    let live = entries
+        .values()
+        .filter(|e| e.kind != EntryKind::Tombstone)
+        .count();
+    let lamport = read_stored_lamport(&state_dir);
+    let root = derive_tree(&entries).root_hash;
+    println!(
+        "root      {}  ({live} entries, lamport {lamport})",
+        &hex(root)[..16]
+    );
+    println!();
+
+    let identity = Identity::load_or_create(&state_dir.join(KEY_FILE))?;
+    let node_id = identity.node_id();
+    let group = GroupState::load_or_init(state_dir.join(PEERS_FILE), node_id)?;
+    let members = group.members();
+    let others: Vec<_> = members
+        .iter()
+        .filter(|m| m.id != node_id.to_string())
+        .collect();
+
+    println!("peers");
+    for member in &members {
+        let marker = if member.id == node_id.to_string() {
+            "  [self]"
+        } else {
+            ""
+        };
+        println!(
+            "  {:8}  {}{}",
+            format!("{:?}", member.status),
+            &member.id[..16],
+            marker
+        );
+    }
+    if others.is_empty() {
+        println!("  (none)");
+    }
+
+    Ok(())
+}
+
+fn daemon_running_status(state_dir: &Path) -> String {
+    let pid_path = state_dir.join(PID_FILE);
+    let Some(pid) = fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok())
+    else {
+        return "stopped".to_string();
+    };
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        format!("running   pid {pid}")
+    } else {
+        "stopped   (stale pid file)".to_string()
+    }
+}
+
+fn read_stored_lamport(state_dir: &Path) -> u64 {
+    fs::read(state_dir.join("lamport"))
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0)
 }
 
 pub fn dump_state_cmd(folder: &Path, prefix: Option<&str>) -> io::Result<()> {
