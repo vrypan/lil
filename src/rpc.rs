@@ -299,7 +299,16 @@ pub async fn spawn_server(
                     handle_connection(stream, addr, identity, state, group, invites_path, events)
                         .await
                 {
-                    tracing::warn!("rpc connection from {addr} failed: {err}");
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                    ) {
+                        tracing::debug!("rpc connection from {addr} closed: {err}");
+                    } else {
+                        tracing::warn!("rpc connection from {addr} failed: {err}");
+                    }
                 }
             });
         }

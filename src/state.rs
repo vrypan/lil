@@ -22,6 +22,7 @@ pub enum EntryKind {
     File,
     Dir,
     Tombstone,
+    Symlink,
 }
 
 impl EntryKind {
@@ -30,6 +31,7 @@ impl EntryKind {
             Self::File => "file",
             Self::Dir => "dir",
             Self::Tombstone => "tombstone",
+            Self::Symlink => "symlink",
         }
     }
 }
@@ -59,6 +61,8 @@ pub struct Entry {
     pub path: String,
     pub kind: EntryKind,
     pub content_hash: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
     pub size: u64,
     pub mode: Option<u32>,
     pub version: Version,
@@ -80,8 +84,11 @@ impl Change {
             (Some(_), EntryKind::Tombstone) => "delete",
             (Some(old), EntryKind::File) if old.kind == EntryKind::File => "file update",
             (Some(old), EntryKind::Dir) if old.kind == EntryKind::Dir => "dir update",
+            (Some(old), EntryKind::Symlink) if old.kind == EntryKind::Symlink => "symlink update",
             (Some(_), EntryKind::File) => "file replace",
             (Some(_), EntryKind::Dir) => "dir replace",
+            (None, EntryKind::Symlink) => "symlink new",
+            (Some(_), EntryKind::Symlink) => "symlink replace",
         }
     }
 }
@@ -101,6 +108,30 @@ pub struct TreeSnapshot {
 }
 
 pub type GcWatermark = BTreeMap<String, u64>;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct LegacyEntry {
+    path: String,
+    kind: EntryKind,
+    content_hash: Option<[u8; 32]>,
+    size: u64,
+    mode: Option<u32>,
+    version: Version,
+}
+
+impl LegacyEntry {
+    fn into_entry(self) -> Entry {
+        Entry {
+            path: self.path,
+            kind: self.kind,
+            content_hash: self.content_hash,
+            symlink_target: None,
+            size: self.size,
+            mode: self.mode,
+            version: self.version,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct FolderState {
@@ -234,6 +265,9 @@ impl FolderState {
             EntryKind::Dir => {
                 install_remote_dir(&self.root.join(&remote.path))?;
             }
+            EntryKind::Symlink => {
+                self.install_remote_symlink(&remote)?;
+            }
             EntryKind::Tombstone => {
                 remove_path_if_exists(&self.root.join(&remote.path))?;
             }
@@ -282,6 +316,22 @@ impl FolderState {
         Ok(())
     }
 
+    fn install_remote_symlink(&self, remote: &Entry) -> io::Result<()> {
+        let dest = self.root.join(&remote.path);
+        let target = remote.symlink_target.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("missing symlink target for {}", remote.path),
+            )
+        })?;
+        validate_symlink_target(target)?;
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        remove_path_if_exists(&dest)?;
+        create_symlink(target, &dest)
+    }
+
     pub fn rescan(&mut self) -> io::Result<Vec<Change>> {
         let ignore_patterns = load_ignore_patterns(&self.root)?;
         let live = scan_folder(&self.root)?;
@@ -325,13 +375,7 @@ impl FolderState {
     pub fn apply_paths(&mut self, abs_paths: Vec<PathBuf>) -> io::Result<Vec<Change>> {
         let canonical_paths: Vec<PathBuf> = abs_paths
             .into_iter()
-            .filter_map(|p| {
-                fs::canonicalize(&p).ok().or_else(|| {
-                    p.parent()
-                        .and_then(|parent| fs::canonicalize(parent).ok())
-                        .map(|parent| parent.join(p.file_name().unwrap_or_default()))
-                })
-            })
+            .filter_map(|p| normalize_event_path(&p))
             .collect();
 
         if canonical_paths
@@ -377,11 +421,26 @@ impl FolderState {
         }
 
         match fs::symlink_metadata(abs_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if let Some(target) = read_supported_symlink(abs_path)? {
+                    let live = Entry {
+                        path: relative.to_string(),
+                        kind: EntryKind::Symlink,
+                        content_hash: None,
+                        symlink_target: Some(target),
+                        size: 0,
+                        mode: None,
+                        version: placeholder_version(),
+                    };
+                    self.update_entry(relative, live, changes);
+                }
+            }
             Ok(metadata) if metadata.is_file() => {
                 let live = Entry {
                     path: relative.to_string(),
                     kind: EntryKind::File,
                     content_hash: Some(hash_file(abs_path)?),
+                    symlink_target: None,
                     size: metadata.len(),
                     mode: mode(&metadata),
                     version: placeholder_version(),
@@ -393,6 +452,7 @@ impl FolderState {
                     path: relative.to_string(),
                     kind: EntryKind::Dir,
                     content_hash: None,
+                    symlink_target: None,
                     size: 0,
                     mode: mode(&metadata),
                     version: placeholder_version(),
@@ -575,9 +635,19 @@ impl FolderState {
 
 fn load_saved_entries(state_dir: &Path) -> BTreeMap<String, Entry> {
     let path = state_dir.join("entries.bin");
-    fs::read(&path)
-        .ok()
-        .and_then(|bytes| bincode::deserialize(&bytes).ok())
+    let Some(bytes) = fs::read(&path).ok() else {
+        return BTreeMap::new();
+    };
+    if let Ok(entries) = bincode::deserialize(&bytes) {
+        return entries;
+    }
+    bincode::deserialize::<BTreeMap<String, LegacyEntry>>(&bytes)
+        .map(|entries| {
+            entries
+                .into_iter()
+                .map(|(path, entry)| (path, entry.into_entry()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -615,6 +685,19 @@ fn install_remote_dir(path: &Path) -> io::Result<()> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => fs::create_dir_all(path),
         Err(err) => Err(err),
     }
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &str, dest: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, dest)
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &str, _dest: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symlink replication is not supported on this platform",
+    ))
 }
 
 fn validate_remote_path(path: &str) -> io::Result<()> {
@@ -665,6 +748,42 @@ fn validate_remote_path(path: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_symlink_target(target: &str) -> io::Result<()> {
+    if target.is_empty() || target.contains('\0') || target.contains('\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid symlink target {target:?}"),
+        ));
+    }
+    let path = Path::new(target);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid symlink target {target:?}"),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_event_path(path: &Path) -> Option<PathBuf> {
+    if path.parent().is_none() {
+        return fs::canonicalize(path).ok();
+    }
+    path.parent()
+        .and_then(|parent| fs::canonicalize(parent).ok())
+        .map(|parent| parent.join(path.file_name().unwrap_or_default()))
+}
+
 impl TreeSnapshot {
     fn empty() -> Self {
         let mut nodes = BTreeMap::new();
@@ -713,6 +832,20 @@ fn scan_dir(
 
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() {
+            if let Some(target) = read_supported_symlink(&path)? {
+                entries.insert(
+                    relative.clone(),
+                    Entry {
+                        path: relative,
+                        kind: EntryKind::Symlink,
+                        content_hash: None,
+                        symlink_target: Some(target),
+                        size: 0,
+                        mode: None,
+                        version: placeholder_version(),
+                    },
+                );
+            }
             continue;
         }
 
@@ -724,6 +857,7 @@ fn scan_dir(
                     path: relative,
                     kind: EntryKind::Dir,
                     content_hash: None,
+                    symlink_target: None,
                     size: 0,
                     mode,
                     version: placeholder_version(),
@@ -737,6 +871,7 @@ fn scan_dir(
                     path: relative,
                     kind: EntryKind::File,
                     content_hash: Some(hash_file(&path)?),
+                    symlink_target: None,
                     size: metadata.len(),
                     mode,
                     version: placeholder_version(),
@@ -746,6 +881,17 @@ fn scan_dir(
     }
 
     Ok(())
+}
+
+fn read_supported_symlink(path: &Path) -> io::Result<Option<String>> {
+    let target = fs::read_link(path)?;
+    let Some(target) = target.to_str().map(|s| s.to_string()) else {
+        return Ok(None);
+    };
+    if validate_symlink_target(&target).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(target))
 }
 
 fn should_ignore(relative: &str, ignore_patterns: &[IgnorePattern]) -> bool {
@@ -954,6 +1100,7 @@ fn tombstone_entry(path: &str, old: &Entry, version: Version) -> Entry {
         path: path.to_string(),
         kind: EntryKind::Tombstone,
         content_hash: None,
+        symlink_target: None,
         size: 0,
         mode: old.mode,
         version,
@@ -971,6 +1118,7 @@ fn same_observed_state(left: &Entry, right: &Entry) -> bool {
     left.path == right.path
         && left.kind == right.kind
         && left.content_hash == right.content_hash
+        && left.symlink_target == right.symlink_target
         && left.size == right.size
         && left.mode == right.mode
 }
@@ -1184,6 +1332,7 @@ fn hash_entry(entry: &Entry) -> [u8; 32] {
     encode_str(&mut hasher, &entry.path);
     encode_str(&mut hasher, entry.kind.as_str());
     encode_opt_hash(&mut hasher, entry.content_hash);
+    encode_opt_str(&mut hasher, entry.symlink_target.as_deref());
     hasher.update(&entry.size.to_be_bytes());
     encode_opt_u32(&mut hasher, entry.mode);
     hasher.update(&entry.version.lamport.to_be_bytes());
@@ -1223,6 +1372,18 @@ fn encode_opt_hash(hasher: &mut blake3::Hasher, value: Option<[u8; 32]>) {
         Some(value) => {
             hasher.update(&[1]);
             hasher.update(&value);
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    };
+}
+
+fn encode_opt_str(hasher: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            encode_str(hasher, value);
         }
         None => {
             hasher.update(&[0]);
@@ -1369,6 +1530,74 @@ mod tests {
         assert!(!state.entries.contains_key("sub/exact.txt"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn scans_symlinks_without_following_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("target.txt"), "target").unwrap();
+        std::os::unix::fs::symlink("target.txt", tmp.path().join("link.txt")).unwrap();
+
+        let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let link = state.entry("link.txt").unwrap();
+
+        assert_eq!(link.kind, EntryKind::Symlink);
+        assert_eq!(link.symlink_target.as_deref(), Some("target.txt"));
+        assert_eq!(link.content_hash, None);
+        assert_eq!(link.size, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applies_higher_version_remote_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let remote = Entry {
+            path: "link.txt".to_string(),
+            kind: EntryKind::Symlink,
+            content_hash: None,
+            symlink_target: Some("target.txt".to_string()),
+            size: 0,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        let change = state.apply_remote_entry(remote, None).unwrap().unwrap();
+
+        assert_eq!(change.verb(), "symlink new");
+        assert_eq!(
+            fs::read_link(tmp.path().join("link.txt")).unwrap(),
+            PathBuf::from("target.txt")
+        );
+        assert_eq!(state.entry("link.txt").unwrap().version.lamport, 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_remote_symlink_targets_that_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let remote = Entry {
+            path: "link.txt".to_string(),
+            kind: EntryKind::Symlink,
+            content_hash: None,
+            symlink_target: Some("../outside.txt".to_string()),
+            size: 0,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        let err = state.apply_remote_entry(remote, None).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!tmp.path().join("link.txt").exists());
+    }
+
     #[test]
     fn nolil_negation_reincludes_path() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1409,6 +1638,7 @@ mod tests {
             path: "remote.txt".to_string(),
             kind: EntryKind::File,
             content_hash: Some(*blake3::hash(bytes).as_bytes()),
+            symlink_target: None,
             size: bytes.len() as u64,
             mode: None,
             version: Version {
@@ -1441,6 +1671,7 @@ mod tests {
             path: "sub".to_string(),
             kind: EntryKind::File,
             content_hash: Some(*blake3::hash(bytes).as_bytes()),
+            symlink_target: None,
             size: bytes.len() as u64,
             mode: None,
             version: Version {
@@ -1467,6 +1698,7 @@ mod tests {
             path: "sub".to_string(),
             kind: EntryKind::Dir,
             content_hash: None,
+            symlink_target: None,
             size: 0,
             mode: None,
             version: Version {
@@ -1490,6 +1722,7 @@ mod tests {
             path: "../outside.txt".to_string(),
             kind: EntryKind::File,
             content_hash: Some(*blake3::hash(bytes).as_bytes()),
+            symlink_target: None,
             size: bytes.len() as u64,
             mode: None,
             version: Version {
@@ -1517,6 +1750,7 @@ mod tests {
             path: ".lil/private.key".to_string(),
             kind: EntryKind::Tombstone,
             content_hash: None,
+            symlink_target: None,
             size: 0,
             mode: None,
             version: Version {
@@ -1546,6 +1780,7 @@ mod tests {
                 path: path.to_string(),
                 kind: EntryKind::Tombstone,
                 content_hash: None,
+                symlink_target: None,
                 size: 0,
                 mode: None,
                 version: Version {
@@ -1567,6 +1802,7 @@ mod tests {
             path: "gone.txt".to_string(),
             kind: EntryKind::Tombstone,
             content_hash: None,
+            symlink_target: None,
             size: 0,
             mode: None,
             version: Version {
@@ -1792,6 +2028,7 @@ mod tests {
             path: "a.txt".to_string(),
             kind: EntryKind::File,
             content_hash: Some([1; 32]),
+            symlink_target: None,
             size: 5,
             mode: None,
             version: Version {
