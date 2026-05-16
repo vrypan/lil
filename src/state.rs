@@ -140,7 +140,12 @@ impl FolderState {
         if validate_remote_path(&remote.path).is_err() {
             return false;
         }
-        if self.is_version_gced(&remote.version) {
+        // The GC watermark prevents re-applying tombstones that have already been
+        // cleaned up. It is intentionally not applied to live entries: the
+        // per-origin max-lamport watermark is too broad and would incorrectly
+        // block legitimate live files from the same origin that predate the
+        // watermark. For the trusted-peer model lil targets, this is acceptable.
+        if remote.kind == EntryKind::Tombstone && self.is_version_gced(&remote.version) {
             return false;
         }
         self.entries
@@ -1471,20 +1476,6 @@ mod tests {
         let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
         assert!(state.entry("a.txt").is_none());
         assert!(!state.should_accept_remote(&tombstone));
-
-        let stale_file = Entry {
-            path: "a.txt".to_string(),
-            kind: EntryKind::File,
-            content_hash: Some([1; 32]),
-            symlink_target: None,
-            size: 5,
-            mode: None,
-            version: Version {
-                lamport: tombstone_version.lamport,
-                origin: tombstone_version.origin,
-            },
-        };
-        assert!(!state.should_accept_remote(&stale_file));
     }
 
     #[test]
