@@ -54,7 +54,6 @@ pub struct Entry {
     pub path: String,
     pub kind: EntryKind,
     pub content_hash: Option<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
     pub size: u64,
     pub mode: Option<u32>,
