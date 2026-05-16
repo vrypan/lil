@@ -164,10 +164,6 @@ impl NoiseConnection {
         Ok(())
     }
 
-    pub async fn shutdown(&mut self) -> io::Result<()> {
-        self.stream.shutdown().await
-    }
-
     async fn send_blob(&mut self, bytes: &[u8]) -> io::Result<()> {
         if bytes.len() > MAX_BLOB_BYTES {
             return Err(io::Error::new(

@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::task::JoinSet;
 
-const MAX_CONCURRENT_FETCHES: usize = 8;
+pub const MAX_CONCURRENT_FETCHES: usize = 8;
 
 pub struct RemoteRoot {
     pub state_root: [u8; 32],
@@ -271,7 +271,16 @@ async fn reconcile_entries(
     remote_node: &TreeNode,
     changes: &mut Vec<Change>,
 ) -> io::Result<()> {
-    // Phase 1: fetch metadata for all changed entries.
+    // Phase 1: fetch all entry metadata for this node in one round trip, then
+    // filter to the entries that actually differ from local.
+    let all_remote: HashMap<String, crate::state::Entry> = ctx
+        .rpc
+        .get_entries(ctx.peer, prefix)
+        .await?
+        .into_iter()
+        .map(|e| (e.path.clone(), e))
+        .collect();
+
     let mut to_apply: Vec<crate::state::Entry> = Vec::new();
     for (name, remote_hash) in &remote_node.entries {
         if local_node
@@ -281,24 +290,21 @@ async fn reconcile_entries(
             continue;
         }
         let path = join_path(prefix, name);
-        let Some(remote_entry) = ctx.rpc.get_entry(ctx.peer, &path).await? else {
-            return Err(io::Error::other(format!(
-                "peer {} did not return entry {path}",
-                ctx.peer
-            )));
-        };
-        if entry_hash(&remote_entry) != *remote_hash {
+        let remote_entry = all_remote.get(&path).ok_or_else(|| {
+            io::Error::other(format!("peer {} did not return entry {path}", ctx.peer))
+        })?;
+        if entry_hash(remote_entry) != *remote_hash {
             return Err(io::Error::other(format!(
                 "peer {} returned stale entry {path}: expected {}, got {}",
                 ctx.peer,
                 hex(*remote_hash),
-                hex(entry_hash(&remote_entry))
+                hex(entry_hash(remote_entry))
             )));
         }
-        if !ctx.state.read().await.should_accept_remote(&remote_entry) {
+        if !ctx.state.read().await.should_accept_remote(remote_entry) {
             continue;
         }
-        to_apply.push(remote_entry);
+        to_apply.push(remote_entry.clone());
     }
 
     // Phase 2: apply non-file entries immediately; download file entries in parallel.

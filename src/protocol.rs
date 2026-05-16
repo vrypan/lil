@@ -24,9 +24,9 @@ pub enum RequestMessage {
         request_id: u64,
         prefix: String,
     },
-    GetEntry {
+    GetEntries {
         request_id: u64,
-        path: String,
+        prefix: String,
     },
     GetObject {
         request_id: u64,
@@ -65,9 +65,9 @@ pub enum ResponseMessage {
         request_id: u64,
         node: Option<TreeNode>,
     },
-    Entry {
+    Entries {
         request_id: u64,
-        entry: Option<Entry>,
+        entries: Vec<Entry>,
     },
     ObjectHeader {
         request_id: u64,

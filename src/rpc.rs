@@ -8,12 +8,13 @@ use crate::identity::{Identity, NodeId};
 use crate::protocol::{RequestMessage, ResponseMessage};
 use crate::state::{Entry, FolderState, TreeNode, hex};
 use crate::transport::{NoiseConnection, max_plaintext_chunk};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, mpsc};
@@ -24,6 +25,38 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const OBJECT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const OBJECT_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+const POOL_SIZE: usize = crate::sync::MAX_CONCURRENT_FETCHES;
+
+struct ConnPool {
+    idle: Mutex<HashMap<NodeId, VecDeque<NoiseConnection>>>,
+}
+
+impl ConnPool {
+    fn checkout(&self, peer: NodeId) -> Option<NoiseConnection> {
+        self.idle
+            .lock()
+            .expect("conn pool poisoned")
+            .get_mut(&peer)
+            .and_then(|q| q.pop_front())
+    }
+
+    fn checkin(&self, peer: NodeId, conn: NoiseConnection) {
+        let mut idle = self.idle.lock().expect("conn pool poisoned");
+        let queue = idle.entry(peer).or_default();
+        if queue.len() < POOL_SIZE {
+            queue.push_back(conn);
+        }
+    }
+}
+
+impl Default for ConnPool {
+    fn default() -> Self {
+        Self {
+            idle: Mutex::new(HashMap::new()),
+        }
+    }
+}
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -42,10 +75,11 @@ pub enum RpcEvent {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RpcClient {
     identity: Arc<Identity>,
     addresses: AddressBook,
+    pool: Arc<ConnPool>,
 }
 
 impl RpcClient {
@@ -53,6 +87,7 @@ impl RpcClient {
         Self {
             identity,
             addresses,
+            pool: Arc::new(ConnPool::default()),
         }
     }
 
@@ -119,23 +154,23 @@ impl RpcClient {
         }
     }
 
-    pub async fn get_entry(&self, peer: NodeId, path: &str) -> io::Result<Option<Entry>> {
+    pub async fn get_entries(&self, peer: NodeId, prefix: &str) -> io::Result<Vec<Entry>> {
         let request_id = next_request_id();
-        let request = RequestMessage::GetEntry {
+        let request = RequestMessage::GetEntries {
             request_id,
-            path: path.to_string(),
+            prefix: prefix.to_string(),
         };
         match self.round_trip(peer, request).await? {
-            ResponseMessage::Entry {
+            ResponseMessage::Entries {
                 request_id: actual,
-                entry,
-            } if actual == request_id => Ok(entry),
+                entries,
+            } if actual == request_id => Ok(entries),
             ResponseMessage::Error {
                 request_id: actual,
                 message,
             } if actual == request_id => Err(io::Error::other(message)),
             response => Err(io::Error::other(format!(
-                "unexpected GetEntry response from {peer}: {response:?}"
+                "unexpected GetEntries response from {peer}: {response:?}"
             ))),
         }
     }
@@ -184,8 +219,11 @@ impl RpcClient {
         }
 
         let result = stream_to_file(peer, &mut conn, size, content_hash, dest).await;
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(dest).await;
+        match &result {
+            Ok(_) => self.pool.checkin(peer, conn),
+            Err(_) => {
+                let _ = tokio::fs::remove_file(dest).await;
+            }
         }
         result
     }
@@ -253,12 +291,33 @@ impl RpcClient {
         peer: NodeId,
         request: RequestMessage,
     ) -> io::Result<ResponseMessage> {
+        // Try a pooled connection first. If it's stale (peer restarted),
+        // discard it and fall through to a fresh connection.
+        if let Some(mut conn) = self.pool.checkout(peer) {
+            let result = rpc_timeout(REQUEST_TIMEOUT, "RPC request", peer, async {
+                conn.send_json(&request).await?;
+                conn.recv_json().await
+            })
+            .await;
+            match result {
+                Ok(response) => {
+                    self.pool.checkin(peer, conn);
+                    return Ok(response);
+                }
+                Err(_) => tracing::debug!("pooled connection to {peer} stale, retrying"),
+            }
+        }
+
         let mut conn = self.connect(peer).await?;
-        rpc_timeout(REQUEST_TIMEOUT, "RPC request", peer, async {
+        let result = rpc_timeout(REQUEST_TIMEOUT, "RPC request", peer, async {
             conn.send_json(&request).await?;
             conn.recv_json().await
         })
-        .await
+        .await;
+        if result.is_ok() {
+            self.pool.checkin(peer, conn);
+        }
+        result
     }
 
     async fn connect(&self, peer: NodeId) -> io::Result<NoiseConnection> {
@@ -349,19 +408,25 @@ async fn handle_connection(
     let mut conn = NoiseConnection::accept(stream, &identity).await?;
     let peer = conn.peer();
     tracing::debug!("incoming rpc peer={peer} addr={addr}");
-    let request: RequestMessage = conn.recv_json().await?;
-    if let RequestMessage::GetObject {
-        request_id,
-        content_hash,
-    } = request
-    {
-        handle_get_object(&mut conn, request_id, content_hash, peer, &state, &group).await
-    } else {
-        let response = handle_request(request, peer, &state, &group, &invites_path, &events).await;
-        conn.send_json(&response).await?;
-        let _ = conn.shutdown().await;
-        Ok(())
+    loop {
+        let request: RequestMessage = match conn.recv_json().await {
+            Ok(r) => r,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        };
+        if let RequestMessage::GetObject {
+            request_id,
+            content_hash,
+        } = request
+        {
+            handle_get_object(&mut conn, request_id, content_hash, peer, &state, &group).await?;
+        } else {
+            let response =
+                handle_request(request, peer, &state, &group, &invites_path, &events).await;
+            conn.send_json(&response).await?;
+        }
     }
+    Ok(())
 }
 
 async fn handle_get_object(
@@ -416,7 +481,6 @@ async fn handle_get_object(
         }
         conn.send_plain_chunk(&buf[..n]).await?;
     }
-    let _ = conn.shutdown().await;
     Ok(())
 }
 
@@ -528,14 +592,30 @@ async fn handle_request(
                 node: state.node(&prefix),
             }
         }
-        RequestMessage::GetEntry { request_id, path } => {
+        RequestMessage::GetEntries { request_id, prefix } => {
             if let Err(e) = check_member(group, peer, request_id).await {
                 return e;
             }
             let state = state.read().await;
-            ResponseMessage::Entry {
+            let entries = match state.node(&prefix) {
+                None => Vec::new(),
+                Some(node) => node
+                    .entries
+                    .keys()
+                    .filter_map(|name| {
+                        let prefix = prefix.trim_matches('/');
+                        let path = if prefix.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{prefix}/{name}")
+                        };
+                        state.entry(&path)
+                    })
+                    .collect(),
+            };
+            ResponseMessage::Entries {
                 request_id,
-                entry: state.entry(&path),
+                entries,
             }
         }
         RequestMessage::Announce {
