@@ -203,6 +203,7 @@ impl FolderState {
             self.tombstone_child_descendants(&path, &mut extra_changes);
         }
         self.save_lamport();
+        self.save_entries();
 
         let mut changed_paths: Vec<String> = vec![path.clone()];
         changed_paths.extend(extra_changes.iter().map(|c| c.path.clone()));
