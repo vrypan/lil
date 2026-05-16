@@ -1,7 +1,7 @@
+use crate::identity::NodeId;
 use crate::message::TreeHint;
 use crate::rpc::RpcClient;
 use crate::state::{Change, EntryKind, FolderState, TreeNode, entry_hash, hex, tree_node_hash};
-use iroh::PublicKey;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ const MAX_CONCURRENT_FETCHES: usize = 8;
 pub async fn reconcile_with_peer(
     rpc: RpcClient,
     state: Arc<RwLock<FolderState>>,
-    peer: PublicKey,
+    peer: NodeId,
 ) -> io::Result<Vec<Change>> {
     let (remote_root, remote_live_root, remote_lamport) = rpc.get_root(peer).await?;
     reconcile_with_advertised_root(
@@ -32,7 +32,7 @@ pub async fn reconcile_with_peer(
 pub async fn reconcile_with_advertised_root(
     rpc: RpcClient,
     state: Arc<RwLock<FolderState>>,
-    peer: PublicKey,
+    peer: NodeId,
     remote_root: [u8; 32],
     remote_live_root: [u8; 32],
     remote_lamport: u64,
@@ -92,7 +92,7 @@ pub async fn reconcile_with_advertised_root(
 struct ReconcileContext<'a> {
     rpc: &'a RpcClient,
     state: &'a Arc<RwLock<FolderState>>,
-    peer: PublicKey,
+    peer: NodeId,
     hinted_nodes: &'a HintedNodes,
 }
 
@@ -176,7 +176,7 @@ impl From<TreeHint> for HintedNodes {
 async fn reconcile_entries(
     rpc: &RpcClient,
     state: &Arc<RwLock<FolderState>>,
-    peer: PublicKey,
+    peer: NodeId,
     prefix: &str,
     local_node: Option<&TreeNode>,
     remote_node: &TreeNode,

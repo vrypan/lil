@@ -1,23 +1,23 @@
+mod discovery;
 mod group;
+mod identity;
 mod message;
 mod protocol;
 mod rpc;
 mod state;
 mod sync;
+mod transport;
 mod watcher;
 
+use crate::discovery::AddressBook;
 use crate::group::GroupState;
+use crate::identity::{Identity, NodeId};
 use crate::message::{GossipMessage, TreeHint};
 use crate::state::{Change, FolderState, GcWatermark, hex};
 use clap::{Parser, Subcommand};
-use futures_lite::StreamExt;
-use iroh::protocol::Router;
-use iroh::{Endpoint, PublicKey, SecretKey};
-use iroh_gossip::api::{ApiError, Event as GossipEvent, GossipSender};
-use iroh_gossip::{ALPN as GOSSIP_ALPN, Gossip, TopicId};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,7 +91,7 @@ enum Command {
 
 #[derive(Debug, Clone)]
 struct JoinTicket {
-    issuer: PublicKey,
+    issuer: NodeId,
     secret: String,
 }
 
@@ -146,15 +146,18 @@ async fn run() -> io::Result<()> {
             fs::create_dir_all(&folder)?;
             let state_dir = folder.join(".lil");
             fs::create_dir_all(&state_dir)?;
-            let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
-            let endpoint = Endpoint::builder()
-                .alpns(vec![GOSSIP_ALPN.to_vec(), rpc::ALPN.to_vec()])
-                .secret_key(secret_key)
-                .bind()
-                .await
-                .map_err(io::Error::other)?;
+            let identity = Arc::new(Identity::load_or_create(&state_dir.join(KEY_FILE))?);
+            let address_book = discovery::new_address_book();
+            let _mdns = discovery::spawn_browser(identity.node_id(), Arc::clone(&address_book))?;
             let peers_path = state_dir.join(PEERS_FILE);
-            join_group(&endpoint, &peers_path, &ticket, name.clone()).await?;
+            join_group(
+                Arc::clone(&identity),
+                address_book,
+                &peers_path,
+                &ticket,
+                name.clone(),
+            )
+            .await?;
             if exit {
                 return Ok(());
             }
@@ -185,23 +188,14 @@ async fn run_sync(
 
     let _lock = acquire_daemon_lock(&state_dir)?;
 
-    let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
-    let endpoint = Endpoint::builder()
-        .alpns(vec![GOSSIP_ALPN.to_vec(), rpc::ALPN.to_vec()])
-        .secret_key(secret_key)
-        .bind()
-        .await
-        .map_err(io::Error::other)?;
-
-    let local_origin = endpoint.id().to_string();
+    let identity = Arc::new(Identity::load_or_create(&state_dir.join(KEY_FILE))?);
+    let local_id = identity.node_id();
+    let local_origin = local_id.to_string();
     let peers_path = state_dir.join(PEERS_FILE);
     let invites_path = state_dir.join(INVITES_FILE);
     let group = Arc::new(RwLock::new(GroupState::load_or_init(
-        peers_path,
-        endpoint.id(),
-        name,
+        peers_path, local_id, name,
     )?));
-    let topic_id = group.read().await.topic_id();
     let bootstrap = group.read().await.active_peers();
     let state = {
         let s = FolderState::new(folder.clone(), local_origin.clone())?;
@@ -209,52 +203,44 @@ async fn run_sync(
     };
     let root_reports = Arc::new(RwLock::new(RootReports::default()));
 
-    {
-        let state = state.read().await;
-        print_start(&state, &endpoint, topic_id, &bootstrap, poll, interval_ms);
-    }
-
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
     let (rpc_event_tx, mut rpc_event_rx) = mpsc::unbounded_channel();
     let watch_root = state.read().await.root().to_path_buf();
     let _watcher = watcher::spawn(watch_root, interval_ms, poll, fs_tx)?;
 
-    let gossip = Gossip::builder().spawn(endpoint.clone());
-    let rpc_client = rpc::RpcClient::new(endpoint.clone());
-    let _router = Router::builder(endpoint.clone())
-        .accept(GOSSIP_ALPN, gossip.clone())
-        .accept(
-            rpc::ALPN,
-            rpc::FolderRpc::new(
-                Arc::clone(&state),
-                Arc::clone(&group),
-                invites_path,
-                rpc_event_tx,
-            ),
-        )
-        .spawn();
+    let address_book = discovery::new_address_book();
+    let (rpc_port, _rpc_server) = rpc::spawn_server(
+        Arc::clone(&identity),
+        Arc::clone(&state),
+        Arc::clone(&group),
+        invites_path,
+        rpc_event_tx,
+    )
+    .await?;
+    let mdns = discovery::spawn(local_id, rpc_port, Arc::clone(&address_book))?;
+    let rpc_client = rpc::RpcClient::new(Arc::clone(&identity), Arc::clone(&address_book));
 
-    let topic = gossip
-        .subscribe(topic_id, bootstrap.clone())
-        .await
-        .map_err(io::Error::other)?;
-    let (sender, mut receiver) = topic.split();
-    if !bootstrap.is_empty()
-        && let Err(err) = sender.join_peers(bootstrap).await
     {
-        tracing::warn!("join known peers failed: {err}");
+        let state = state.read().await;
+        print_start(&state, local_id, rpc_port, &bootstrap, poll, interval_ms);
     }
 
     {
         let state = state.read().await;
-        publish_sync_state(&sender, &StateSnapshot::from_state(&state), &local_origin).await;
+        publish_sync_state(
+            &rpc_client,
+            Arc::clone(&group),
+            &StateSnapshot::from_state(&state),
+            &local_origin,
+        )
+        .await;
     }
-    publish_peers(&sender, Arc::clone(&group), &local_origin).await;
+    publish_peers(&rpc_client, Arc::clone(&group), &local_origin).await;
     maybe_gc_tombstones(
         Arc::clone(&state),
         Arc::clone(&group),
         Arc::clone(&root_reports),
-        &sender,
+        &rpc_client,
         &local_origin,
     )
     .await;
@@ -262,9 +248,16 @@ async fn run_sync(
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(announce_interval_secs.max(1)));
     announce_interval.tick().await;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received");
+                mdns.announce_removal().await;
+                return Ok(());
+            }
             Some(paths) = fs_rx.recv() => {
                 let update = {
                     let mut state = state.write().await;
@@ -291,22 +284,15 @@ async fn run_sync(
                 };
                 if let Some((changes, snapshot, hint)) = update {
                     tracing::info!("filesystem changed paths={}", changes.len());
-                    publish_filesystem_changed(&sender, &snapshot, &local_origin, hint).await;
+                    publish_filesystem_changed(
+                        &rpc_client,
+                        Arc::clone(&group),
+                        &snapshot,
+                        &local_origin,
+                        hint,
+                    )
+                    .await;
                 }
-            }
-            event = receiver.next() => {
-                let Some(event) = event else {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gossip stream closed"));
-                };
-                handle_gossip_event(
-                    event,
-                    rpc_client.clone(),
-                    Arc::clone(&state),
-                    Arc::clone(&group),
-                    Arc::clone(&root_reports),
-                    &sender,
-                    &local_origin,
-                ).await?;
             }
             Some(event) = rpc_event_rx.recv() => {
                 match event {
@@ -315,10 +301,18 @@ async fn run_sync(
                             Some(n) => tracing::info!("peer joined {peer} ({n})"),
                             None    => tracing::info!("peer joined {peer}"),
                         };
-                        if let Err(err) = sender.join_peers(vec![peer]).await {
-                            tracing::warn!("join new peer failed: {err}");
-                        }
-                        publish_peers(&sender, Arc::clone(&group), &local_origin).await;
+                        publish_peers(&rpc_client, Arc::clone(&group), &local_origin).await;
+                    }
+                    rpc::RpcEvent::Announcement { peer, message } => {
+                        tracing::debug!("announcement from {peer}");
+                        handle_announcement(
+                            message,
+                            rpc_client.clone(),
+                            Arc::clone(&state),
+                            Arc::clone(&group),
+                            Arc::clone(&root_reports),
+                            &local_origin,
+                        ).await?;
                     }
                 }
             }
@@ -327,10 +321,28 @@ async fn run_sync(
                     let state = state.read().await;
                     StateSnapshot::from_state(&state)
                 };
-                publish_sync_state(&sender, &snapshot, &local_origin).await;
-                publish_peers(&sender, Arc::clone(&group), &local_origin).await;
+                publish_sync_state(&rpc_client, Arc::clone(&group), &snapshot, &local_origin).await;
+                publish_peers(&rpc_client, Arc::clone(&group), &local_origin).await;
             }
         }
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -388,7 +400,12 @@ impl RootReports {
     }
 }
 
-async fn publish_sync_state(sender: &GossipSender, state: &StateSnapshot, origin: &str) {
+async fn publish_sync_state(
+    rpc_client: &rpc::RpcClient,
+    group: Arc<RwLock<GroupState>>,
+    state: &StateSnapshot,
+    origin: &str,
+) {
     let message = GossipMessage::SyncState {
         origin: origin.to_string(),
         state_root: state.state_root,
@@ -398,11 +415,12 @@ async fn publish_sync_state(sender: &GossipSender, state: &StateSnapshot, origin
         live_nodes: state.live_nodes,
         gc_watermark: state.gc_watermark.clone(),
     };
-    publish(sender, message).await;
+    publish(rpc_client, group, message).await;
 }
 
 async fn publish_filesystem_changed(
-    sender: &GossipSender,
+    rpc_client: &rpc::RpcClient,
+    group: Arc<RwLock<GroupState>>,
     state: &StateSnapshot,
     origin: &str,
     hint: Option<TreeHint>,
@@ -414,16 +432,16 @@ async fn publish_filesystem_changed(
         lamport: state.lamport,
         hint,
     };
-    publish(sender, message).await;
+    publish(rpc_client, group, message).await;
 }
 
-async fn publish_peers(sender: &GossipSender, group: Arc<RwLock<GroupState>>, origin: &str) {
+async fn publish_peers(rpc_client: &rpc::RpcClient, group: Arc<RwLock<GroupState>>, origin: &str) {
     let members = group.read().await.members();
     let message = GossipMessage::Peers {
         origin: origin.to_string(),
         members,
     };
-    publish(sender, message).await;
+    publish(rpc_client, group, message).await;
 }
 
 fn build_tree_hint(
@@ -504,101 +522,83 @@ fn path_prefixes(path: &str) -> Vec<String> {
     out
 }
 
-async fn publish(sender: &GossipSender, message: GossipMessage) {
-    tracing::debug!("gossip send {}", summarize_message(&message));
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        sender.broadcast(message.to_bytes().into()),
-    )
-    .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => tracing::warn!("gossip publish failed: {err}"),
-        Err(_) => tracing::warn!("gossip publish timed out — connection likely dead"),
+async fn publish(
+    rpc_client: &rpc::RpcClient,
+    group: Arc<RwLock<GroupState>>,
+    message: GossipMessage,
+) {
+    tracing::debug!("announce send {}", summarize_message(&message));
+    let peers = group.read().await.active_peers();
+    for peer in peers {
+        let rpc_client = rpc_client.clone();
+        let message = message.clone();
+        tokio::spawn(async move {
+            if let Err(err) = rpc_client.announce(peer, message).await {
+                tracing::debug!("announce peer={peer} failed: {err}");
+            }
+        });
     }
 }
 
-async fn handle_gossip_event(
-    event: Result<GossipEvent, ApiError>,
+async fn handle_announcement(
+    message: GossipMessage,
     rpc_client: rpc::RpcClient,
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
     root_reports: Arc<RwLock<RootReports>>,
-    sender: &GossipSender,
     local_origin: &str,
 ) -> io::Result<()> {
-    match event {
-        Ok(GossipEvent::Received(message)) => {
-            let Some(message) = GossipMessage::from_bytes(&message.content) else {
-                tracing::debug!("ignored unknown gossip message");
-                return Ok(());
-            };
-            if message.origin() == local_origin {
-                return Ok(());
-            }
-            if !is_active_origin(&group, message.origin()).await {
-                tracing::debug!("ignored gossip from non-member {}", message.origin());
-                return Ok(());
-            }
-            if let Some(snapshot) =
-                merge_remote_gc_watermark(Arc::clone(&state), message_gc_watermark(&message)).await
-            {
-                publish_sync_state(sender, &snapshot, local_origin).await;
-            }
-            let local = {
-                let state = state.read().await;
-                StateSnapshot::from_state(&state)
-            };
-            print_remote_message(&message, &local);
-            record_root_report(Arc::clone(&root_reports), &message).await;
-            match &message {
-                GossipMessage::Peers { members, .. } => {
-                    let update = group.write().await.merge_members(members.clone())?;
-                    if update.changed {
-                        tracing::info!("peers updated active={}", update.active_peers.len());
-                        if let Err(err) = sender.join_peers(update.active_peers).await {
-                            tracing::warn!("join peers from gossip failed: {err}");
-                        }
-                        if update.removed_self {
-                            tracing::warn!("this node is marked removed from the group");
-                        }
-                    }
-                    maybe_gc_tombstones(
-                        Arc::clone(&state),
-                        Arc::clone(&group),
-                        Arc::clone(&root_reports),
-                        sender,
-                        local_origin,
-                    )
-                    .await;
+    if message.origin() == local_origin {
+        return Ok(());
+    }
+    if !is_active_origin(&group, message.origin()).await {
+        tracing::debug!("ignored announcement from non-member {}", message.origin());
+        return Ok(());
+    }
+    if let Some(snapshot) =
+        merge_remote_gc_watermark(Arc::clone(&state), message_gc_watermark(&message)).await
+    {
+        publish_sync_state(&rpc_client, Arc::clone(&group), &snapshot, local_origin).await;
+    }
+    let local = {
+        let state = state.read().await;
+        StateSnapshot::from_state(&state)
+    };
+    print_remote_message(&message, &local);
+    record_root_report(Arc::clone(&root_reports), &message).await;
+    match &message {
+        GossipMessage::Peers { members, .. } => {
+            let update = group.write().await.merge_members(members.clone())?;
+            if update.changed {
+                tracing::info!("peers updated active={}", update.active_peers.len());
+                if update.removed_self {
+                    tracing::warn!("this node is marked removed from the group");
                 }
-                _ => maybe_probe_remote_rpc(
-                    rpc_client,
-                    message,
-                    state,
-                    Arc::clone(&group),
-                    root_reports,
-                    sender.clone(),
-                    local_origin.to_string(),
-                ),
             }
+            maybe_gc_tombstones(
+                Arc::clone(&state),
+                Arc::clone(&group),
+                Arc::clone(&root_reports),
+                &rpc_client,
+                local_origin,
+            )
+            .await;
         }
-        Ok(GossipEvent::NeighborUp(endpoint_id)) => {
-            tracing::info!("gossip neighbor up {endpoint_id}");
-        }
-        Ok(GossipEvent::NeighborDown(endpoint_id)) => {
-            tracing::info!("gossip neighbor down {endpoint_id}");
-        }
-        Ok(GossipEvent::Lagged) => {
-            tracing::warn!("gossip stream lagged");
-        }
-        Err(err) => tracing::warn!("gossip receive failed: {err}"),
+        _ => maybe_probe_remote_rpc(
+            rpc_client.clone(),
+            message,
+            state,
+            Arc::clone(&group),
+            root_reports,
+            rpc_client,
+            local_origin.to_string(),
+        ),
     }
     Ok(())
 }
 
 async fn is_active_origin(group: &Arc<RwLock<GroupState>>, origin: &str) -> bool {
-    let Ok(peer) = origin.parse::<PublicKey>() else {
+    let Ok(peer) = origin.parse::<NodeId>() else {
         return false;
     };
     group.read().await.is_active_member(&peer)
@@ -668,7 +668,7 @@ async fn maybe_gc_tombstones(
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
     root_reports: Arc<RwLock<RootReports>>,
-    sender: &GossipSender,
+    rpc_client: &rpc::RpcClient,
     local_origin: &str,
 ) {
     let (local_root, active_peer_ids) = {
@@ -697,7 +697,7 @@ async fn maybe_gc_tombstones(
         state.save_entries();
         StateSnapshot::from_state(&state)
     };
-    publish_sync_state(sender, &snapshot, local_origin).await;
+    publish_sync_state(rpc_client, group, &snapshot, local_origin).await;
 }
 
 fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
@@ -757,7 +757,7 @@ fn maybe_probe_remote_rpc(
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
     root_reports: Arc<RwLock<RootReports>>,
-    sender: GossipSender,
+    publisher: rpc::RpcClient,
     local_origin: String,
 ) {
     let (origin, remote_state_root, remote_live_root, remote_lamport, hint, use_advertised_root) =
@@ -779,7 +779,7 @@ fn maybe_probe_remote_rpc(
             } => (origin, state_root, live_root, lamport, hint, true),
             GossipMessage::Peers { .. } => return,
         };
-    let Ok(peer) = origin.parse::<PublicKey>() else {
+    let Ok(peer) = origin.parse::<NodeId>() else {
         tracing::warn!("cannot RPC probe peer with invalid origin {origin}");
         return;
     };
@@ -826,7 +826,7 @@ fn maybe_probe_remote_rpc(
                     let state = state.read().await;
                     StateSnapshot::from_state(&state)
                 };
-                publish_sync_state(&sender, &snapshot, &local_origin).await;
+                publish_sync_state(&publisher, Arc::clone(&group), &snapshot, &local_origin).await;
             }
             Err(err) => {
                 tracing::warn!("sync peer={} failed: {err}", peer);
@@ -838,7 +838,7 @@ fn maybe_probe_remote_rpc(
             Arc::clone(&state),
             Arc::clone(&group),
             Arc::clone(&root_reports),
-            &sender,
+            &publisher,
             &local_origin,
         )
         .await;
@@ -847,14 +847,14 @@ fn maybe_probe_remote_rpc(
 
 fn print_start(
     state: &FolderState,
-    endpoint: &Endpoint,
-    topic_id: TopicId,
-    bootstrap: &[PublicKey],
+    local_id: NodeId,
+    rpc_port: u16,
+    bootstrap: &[NodeId],
     poll: bool,
     interval_ms: u64,
 ) {
-    tracing::info!("node {}", endpoint.id());
-    tracing::info!("topic {}", hex(*topic_id.as_bytes()));
+    tracing::info!("node {}", local_id);
+    tracing::info!("rpc port {}", rpc_port);
     tracing::info!("invite command: lil invite {}", state.root().display());
     tracing::info!("known peers {}", bootstrap.len());
     tracing::info!("watching {}", state.root().display());
@@ -929,8 +929,8 @@ fn summarize_message(message: &GossipMessage) -> String {
 }
 
 fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
-    let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
-    let node_id = secret_key.public();
+    let identity = Identity::load_or_create(&state_dir.join(KEY_FILE))?;
+    let node_id = identity.node_id();
     let peers_path = state_dir.join(PEERS_FILE);
     let _group = GroupState::load_or_init(peers_path, node_id, None)?;
     let secret_bytes = group::generate_secret()?;
@@ -943,8 +943,8 @@ fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
 }
 
 fn peers_cmd(state_dir: &Path) -> io::Result<()> {
-    let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
-    let node_id = secret_key.public();
+    let identity = Identity::load_or_create(&state_dir.join(KEY_FILE))?;
+    let node_id = identity.node_id();
     let peers_path = state_dir.join(PEERS_FILE);
     let group = GroupState::load_or_init(peers_path, node_id, None)?;
     for member in group.members() {
@@ -963,8 +963,8 @@ fn peers_cmd(state_dir: &Path) -> io::Result<()> {
 }
 
 fn remove_peer_cmd(state_dir: &Path, target: &str) -> io::Result<()> {
-    let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
-    let node_id = secret_key.public();
+    let identity = Identity::load_or_create(&state_dir.join(KEY_FILE))?;
+    let node_id = identity.node_id();
     let peers_path = state_dir.join(PEERS_FILE);
     let mut group = GroupState::load_or_init(peers_path, node_id, None)?;
     match group.remove_peer(target)? {
@@ -981,39 +981,20 @@ fn remove_peer_cmd(state_dir: &Path, target: &str) -> io::Result<()> {
 }
 
 async fn join_group(
-    endpoint: &Endpoint,
+    identity: Arc<Identity>,
+    address_book: AddressBook,
     peers_path: &Path,
     ticket: &str,
     name: Option<String>,
 ) -> io::Result<()> {
     let ticket = parse_join_ticket(ticket)?;
-    let rpc_client = rpc::RpcClient::new(endpoint.clone());
-    let (topic_id, members) = rpc_client
-        .join_group(ticket.issuer, ticket.secret, endpoint.id(), name)
+    let rpc_client = rpc::RpcClient::new(Arc::clone(&identity), address_book);
+    let members = rpc_client
+        .join_group(ticket.issuer, ticket.secret, identity.node_id(), name)
         .await?;
-    let topic_id = topic_id
-        .parse()
-        .map_err(|err| io::Error::other(format!("invalid topic id from join response: {err}")))?;
-    GroupState::replace(peers_path, topic_id, members)?;
+    GroupState::replace(peers_path, members)?;
     tracing::info!("joined group via {}", ticket.issuer);
     Ok(())
-}
-
-fn load_or_create_secret_key(path: &Path) -> io::Result<SecretKey> {
-    if let Ok(bytes) = fs::read(path) {
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| io::Error::other("invalid iroh key file length"))?;
-        return Ok(SecretKey::from_bytes(&bytes));
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut bytes = [0u8; 32];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    fs::write(path, bytes)?;
-    Ok(SecretKey::from_bytes(&bytes))
 }
 
 #[cfg(unix)]
@@ -1057,14 +1038,13 @@ fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
 
 fn parse_join_ticket(value: &str) -> io::Result<JoinTicket> {
     let bytes = ticket_base62_decode(value)?;
-    let issuer = PublicKey::from_bytes(&bytes[..32].try_into().unwrap())
-        .map_err(|err| io::Error::other(format!("invalid node id in ticket: {err}")))?;
+    let issuer = NodeId::from_bytes(bytes[..32].try_into().unwrap());
     let secret_arr: [u8; 32] = bytes[32..].try_into().unwrap();
     let secret = hex(secret_arr);
     Ok(JoinTicket { issuer, secret })
 }
 
-fn encode_ticket(node_id: PublicKey, secret_bytes: &[u8; 32]) -> String {
+fn encode_ticket(node_id: NodeId, secret_bytes: &[u8; 32]) -> String {
     let mut combined = [0u8; 64];
     combined[..32].copy_from_slice(node_id.as_bytes());
     combined[32..].copy_from_slice(secret_bytes);
@@ -1144,7 +1124,7 @@ mod tests {
 
     #[test]
     fn join_ticket_roundtrips() {
-        let issuer = SecretKey::from_bytes(&[7; 32]).public();
+        let issuer = NodeId::from_bytes([7; 32]);
         let secret_bytes = [0xABu8; 32];
         let ticket_str = encode_ticket(issuer, &secret_bytes);
         assert_eq!(ticket_str.len(), TICKET_CHARS);
@@ -1158,10 +1138,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let key_path = tmp.path().join(KEY_FILE);
 
-        let first = load_or_create_secret_key(&key_path).unwrap();
-        let second = load_or_create_secret_key(&key_path).unwrap();
+        let first = Identity::load_or_create(&key_path).unwrap();
+        let second = Identity::load_or_create(&key_path).unwrap();
 
-        assert_eq!(first.public(), second.public());
+        assert_eq!(first.node_id(), second.node_id());
         assert_eq!(fs::read(key_path).unwrap().len(), 32);
     }
 

@@ -9,12 +9,10 @@
 - Designed for peer-to-peer sync between your own machines or other trusted
   peers.
 
-- End-to-end encrypted: `lil` uses
-  [iroh and iroh-gossip](https://www.iroh.computer) for end-to-end encrypted 
-  connections over QUIC.
+- End-to-end encrypted on the LAN: peers discover each other with mDNS and use
+  Noise-encrypted TCP connections authenticated by their Ed25519 node keys.
 
-- Connections work even when nodes are behind NAT. Iroh relay servers
-  facilitate the handshake but cannot see the encrypted data.
+- LAN-only by design: there is no relay, NAT traversal, or remote discovery.
 
 - No central node: every node is equal. Each keeps a full copy of the synced
   folder and each can invite new nodes.
@@ -112,12 +110,12 @@ being tracked locally; they are **not** deleted on remote peers.
 
 - `.lil/` is always excluded from sync. Temporary files for in-flight
   transfers (`recv-*`) are stored there and removed on completion or error.
-- File content is streamed over QUIC without buffering the whole file in
+- File content is streamed over encrypted TCP without buffering the whole file in
   memory; BLAKE3 hash is verified before the temp file is renamed into place.
 - Up to 8 file downloads run in parallel per reconciliation pass.
 - Periodic `SyncState` broadcasts (default every 10 s) drive repair: any node
   with a different root hash initiates a Merkle tree sync. Filesystem-change
-  gossip also includes a small bounded tree hint to reduce follow-up RPCs.
+  announcements also include a small bounded tree hint to reduce follow-up RPCs.
 - Tombstones (records of deleted files) are persisted across restarts and
   garbage-collected after all active peers report the same state root. Nodes
   publish GC watermarks so stale tombstones are not accepted again later.

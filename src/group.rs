@@ -1,6 +1,5 @@
+use crate::identity::NodeId;
 use crate::state::hex;
-use iroh::PublicKey;
-use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -26,7 +25,8 @@ pub struct MemberEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeersFile {
-    topic_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic_id: Option<String>,
     #[serde(default)]
     members: Vec<MemberEntry>,
 }
@@ -35,7 +35,6 @@ struct PeersFile {
 pub struct GroupState {
     path: PathBuf,
     local_id: String,
-    topic_id: TopicId,
     members: BTreeMap<String, MemberEntry>,
 }
 
@@ -43,15 +42,11 @@ pub struct GroupState {
 pub struct MemberMerge {
     pub changed: bool,
     pub removed_self: bool,
-    pub active_peers: Vec<PublicKey>,
+    pub active_peers: Vec<NodeId>,
 }
 
 impl GroupState {
-    pub fn load_or_init(
-        path: PathBuf,
-        local_id: PublicKey,
-        name: Option<String>,
-    ) -> io::Result<Self> {
+    pub fn load_or_init(path: PathBuf, local_id: NodeId, name: Option<String>) -> io::Result<Self> {
         let local_id = local_id.to_string();
         let loaded = match fs::read_to_string(&path) {
             Ok(contents) => Some(serde_json::from_str::<PeersFile>(&contents).map_err(|err| {
@@ -61,10 +56,6 @@ impl GroupState {
             Err(err) => return Err(err),
         };
 
-        let topic_id = match loaded.as_ref() {
-            Some(file) => parse_topic_id(&file.topic_id)?,
-            None => new_topic_id()?,
-        };
         let mut members: BTreeMap<String, MemberEntry> = loaded
             .map(|file| {
                 file.members
@@ -99,26 +90,21 @@ impl GroupState {
         let state = Self {
             path,
             local_id,
-            topic_id,
             members,
         };
         state.persist()?;
         Ok(state)
     }
 
-    pub fn replace(path: &Path, topic_id: TopicId, members: Vec<MemberEntry>) -> io::Result<()> {
-        save_peers_file(path, topic_id, members)
-    }
-
-    pub fn topic_id(&self) -> TopicId {
-        self.topic_id
+    pub fn replace(path: &Path, members: Vec<MemberEntry>) -> io::Result<()> {
+        save_peers_file(path, members)
     }
 
     pub fn members(&self) -> Vec<MemberEntry> {
         self.members.values().cloned().collect()
     }
 
-    pub fn active_peers(&self) -> Vec<PublicKey> {
+    pub fn active_peers(&self) -> Vec<NodeId> {
         active_peers_from_members(&self.local_id, self.members.values())
     }
 
@@ -131,13 +117,13 @@ impl GroupState {
             .collect()
     }
 
-    pub fn is_active_member(&self, peer: &PublicKey) -> bool {
+    pub fn is_active_member(&self, peer: &NodeId) -> bool {
         self.members
             .get(&peer.to_string())
             .is_some_and(|entry| entry.status == MemberStatus::Active)
     }
 
-    pub fn add_active_peer(&mut self, peer: PublicKey, name: Option<String>) -> io::Result<bool> {
+    pub fn add_active_peer(&mut self, peer: NodeId, name: Option<String>) -> io::Result<bool> {
         let id = peer.to_string();
         let lamport = next_lamport(&self.members);
         let changed = match self.members.get_mut(&id) {
@@ -227,7 +213,7 @@ impl GroupState {
     }
 
     fn persist(&self) -> io::Result<()> {
-        save_peers_file(&self.path, self.topic_id, self.members())
+        save_peers_file(&self.path, self.members())
     }
 }
 
@@ -285,7 +271,7 @@ pub fn now_ms() -> io::Result<u64> {
 fn active_peers_from_members<'a>(
     local_id: &str,
     members: impl IntoIterator<Item = &'a MemberEntry>,
-) -> Vec<PublicKey> {
+) -> Vec<NodeId> {
     members
         .into_iter()
         .filter(|entry| entry.id != local_id)
@@ -294,29 +280,13 @@ fn active_peers_from_members<'a>(
         .collect()
 }
 
-fn new_topic_id() -> io::Result<TopicId> {
-    let mut bytes = [0_u8; 32];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(TopicId::from_bytes(bytes))
-}
-
-fn parse_topic_id(value: &str) -> io::Result<TopicId> {
-    value
-        .parse()
-        .map_err(|err| io::Error::other(format!("invalid stored topic id: {err}")))
-}
-
-fn save_peers_file(
-    path: &Path,
-    topic_id: TopicId,
-    mut members: Vec<MemberEntry>,
-) -> io::Result<()> {
+fn save_peers_file(path: &Path, mut members: Vec<MemberEntry>) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     members.sort_by(|left, right| left.id.cmp(&right.id));
     let file = PeersFile {
-        topic_id: hex(*topic_id.as_bytes()),
+        topic_id: None,
         members,
     };
     let json = serde_json::to_string_pretty(&file).map_err(io::Error::other)?;
@@ -356,6 +326,10 @@ fn hash_secret(secret: &str) -> String {
 mod tests {
     use super::*;
 
+    fn node(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 32])
+    }
+
     #[test]
     fn invite_is_one_time() {
         let tmp = tempfile::tempdir().unwrap();
@@ -370,8 +344,8 @@ mod tests {
     #[test]
     fn member_merge_keeps_newest_lamport() {
         let tmp = tempfile::tempdir().unwrap();
-        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
-        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let local = node(1);
+        let peer = node(2);
         let mut state =
             GroupState::load_or_init(tmp.path().join("peers.json"), local, None).unwrap();
 
@@ -402,7 +376,7 @@ mod tests {
     #[test]
     fn name_propagates_via_load_or_init() {
         let tmp = tempfile::tempdir().unwrap();
-        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let local = node(1);
         let path = tmp.path().join("peers.json");
 
         GroupState::load_or_init(path.clone(), local, Some("alice".to_string())).unwrap();
@@ -419,7 +393,7 @@ mod tests {
     #[test]
     fn name_update_bumps_lamport() {
         let tmp = tempfile::tempdir().unwrap();
-        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let local = node(1);
         let path = tmp.path().join("peers.json");
 
         let s1 = GroupState::load_or_init(path.clone(), local, Some("alice".to_string())).unwrap();
@@ -443,8 +417,8 @@ mod tests {
     #[test]
     fn remove_peer_by_id_and_by_name() {
         let tmp = tempfile::tempdir().unwrap();
-        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
-        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let local = node(1);
+        let peer = node(2);
         let path = tmp.path().join("peers.json");
         let mut state = GroupState::load_or_init(path, local, None).unwrap();
 
@@ -467,7 +441,7 @@ mod tests {
     #[test]
     fn remove_self_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
-        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let local = node(1);
         let path = tmp.path().join("peers.json");
         let mut state = GroupState::load_or_init(path, local, None).unwrap();
         assert!(state.remove_peer(&local.to_string()).is_err());

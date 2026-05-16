@@ -1,27 +1,25 @@
+use crate::discovery::AddressBook;
 use crate::group::{self, GroupState, MemberEntry};
-use crate::protocol::{
-    RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, write_frame,
-};
+use crate::identity::{Identity, NodeId};
+use crate::protocol::{RequestMessage, ResponseMessage};
 use crate::state::{Entry, FolderState, TreeNode, hex};
-use iroh::endpoint::{Connection, ConnectionError};
-use iroh::protocol::{AcceptError, ProtocolHandler};
-use iroh::{Endpoint, PublicKey};
-use std::collections::HashMap;
+use crate::transport::{NoiseConnection, max_plaintext_chunk};
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::{Duration, Instant, timeout};
 
-pub const ALPN: &[u8] = b"lil/rpc/1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const OBJECT_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const OBJECT_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_CONNECTION_AGE: Duration = Duration::from_secs(30 * 60);
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -30,58 +28,32 @@ fn next_request_id() -> u64 {
 }
 
 #[derive(Debug, Clone)]
-pub struct FolderRpc {
-    state: Arc<RwLock<FolderState>>,
-    group: Arc<RwLock<GroupState>>,
-    invites_path: Arc<PathBuf>,
-    events: mpsc::UnboundedSender<RpcEvent>,
-}
-
-#[derive(Debug, Clone)]
 pub enum RpcEvent {
     PeerJoined {
-        peer: PublicKey,
+        peer: NodeId,
         name: Option<String>,
     },
-}
-
-impl FolderRpc {
-    pub fn new(
-        state: Arc<RwLock<FolderState>>,
-        group: Arc<RwLock<GroupState>>,
-        invites_path: PathBuf,
-        events: mpsc::UnboundedSender<RpcEvent>,
-    ) -> Self {
-        Self {
-            state,
-            group,
-            invites_path: Arc::new(invites_path),
-            events,
-        }
-    }
+    Announcement {
+        peer: NodeId,
+        message: crate::message::GossipMessage,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct RpcClient {
-    endpoint: Endpoint,
-    connections: Arc<Mutex<HashMap<PublicKey, CachedConnection>>>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedConnection {
-    connection: Connection,
-    created_at: Instant,
+    identity: Arc<Identity>,
+    addresses: AddressBook,
 }
 
 impl RpcClient {
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub fn new(identity: Arc<Identity>, addresses: AddressBook) -> Self {
         Self {
-            endpoint,
-            connections: Arc::new(Mutex::new(HashMap::new())),
+            identity,
+            addresses,
         }
     }
 
-    pub async fn get_root(&self, peer: PublicKey) -> io::Result<([u8; 32], [u8; 32], u64)> {
+    pub async fn get_root(&self, peer: NodeId) -> io::Result<([u8; 32], [u8; 32], u64)> {
         let request_id = next_request_id();
         match self
             .round_trip(peer, RequestMessage::GetRoot { request_id })
@@ -103,7 +75,7 @@ impl RpcClient {
         }
     }
 
-    pub async fn get_node(&self, peer: PublicKey, prefix: &str) -> io::Result<Option<TreeNode>> {
+    pub async fn get_node(&self, peer: NodeId, prefix: &str) -> io::Result<Option<TreeNode>> {
         let request_id = next_request_id();
         let request = RequestMessage::GetNode {
             request_id,
@@ -124,7 +96,7 @@ impl RpcClient {
         }
     }
 
-    pub async fn get_entry(&self, peer: PublicKey, path: &str) -> io::Result<Option<Entry>> {
+    pub async fn get_entry(&self, peer: NodeId, path: &str) -> io::Result<Option<Entry>> {
         let request_id = next_request_id();
         let request = RequestMessage::GetEntry {
             request_id,
@@ -147,7 +119,7 @@ impl RpcClient {
 
     pub async fn get_object_to_file(
         &self,
-        peer: PublicKey,
+        peer: NodeId,
         content_hash: [u8; 32],
         expected_size: u64,
         dest: &Path,
@@ -157,44 +129,51 @@ impl RpcClient {
             request_id,
             content_hash,
         };
-        let connection = self.connection(peer).await?;
-        match get_object_to_file_on_connection(
-            &connection,
+        let mut conn = self.connect(peer).await?;
+        conn.send_json(&request).await?;
+
+        let header: ResponseMessage = rpc_timeout(
+            OBJECT_HEADER_TIMEOUT,
+            "read object header",
             peer,
-            request_id,
-            &request,
-            content_hash,
-            expected_size,
-            dest,
+            conn.recv_json(),
         )
-        .await
-        {
-            Ok(()) => Ok(()),
-            Err(first_err) => {
-                self.drop_connection(peer).await;
-                tracing::debug!(target: "lil::rpc", %peer, "retrying GetObject after: {first_err}");
-                let connection = self.connection(peer).await?;
-                get_object_to_file_on_connection(
-                    &connection,
-                    peer,
-                    request_id,
-                    &request,
-                    content_hash,
-                    expected_size,
-                    dest,
-                )
-                .await
+        .await?;
+        let size = match header {
+            ResponseMessage::ObjectHeader {
+                request_id: actual,
+                size,
+            } if actual == request_id => size,
+            ResponseMessage::Error {
+                request_id: actual,
+                message,
+            } if actual == request_id => return Err(io::Error::other(message)),
+            response => {
+                return Err(io::Error::other(format!(
+                    "unexpected GetObject response from {peer}: {response:?}"
+                )));
             }
+        };
+        if size != expected_size {
+            return Err(io::Error::other(format!(
+                "object size mismatch from {peer}: expected {expected_size}, got {size}"
+            )));
         }
+
+        let result = stream_to_file(peer, &mut conn, size, content_hash, dest).await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        result
     }
 
     pub async fn join_group(
         &self,
-        peer: PublicKey,
+        peer: NodeId,
         secret: String,
-        joiner_id: PublicKey,
+        joiner_id: NodeId,
         name: Option<String>,
-    ) -> io::Result<(String, Vec<MemberEntry>)> {
+    ) -> io::Result<Vec<MemberEntry>> {
         let request_id = next_request_id();
         let request = RequestMessage::Join {
             request_id,
@@ -205,9 +184,8 @@ impl RpcClient {
         match self.round_trip(peer, request).await? {
             ResponseMessage::JoinAccepted {
                 request_id: actual,
-                topic_id,
                 members,
-            } if actual == request_id => Ok((topic_id, members)),
+            } if actual == request_id => Ok(members),
             ResponseMessage::JoinRejected {
                 request_id: actual,
                 reason,
@@ -222,182 +200,188 @@ impl RpcClient {
         }
     }
 
-    async fn round_trip(
+    pub async fn announce(
         &self,
-        peer: PublicKey,
-        request: RequestMessage,
-    ) -> io::Result<ResponseMessage> {
-        let connection = self.connection(peer).await?;
-        match rpc_timeout(
-            REQUEST_TIMEOUT,
-            "RPC request",
-            peer,
-            round_trip_on_connection(&connection, peer, &request),
-        )
-        .await
-        .and_then(|result| result)
+        peer: NodeId,
+        message: crate::message::GossipMessage,
+    ) -> io::Result<()> {
+        let request_id = next_request_id();
+        match self
+            .round_trip(
+                peer,
+                RequestMessage::Announce {
+                    request_id,
+                    message,
+                },
+            )
+            .await?
         {
-            Ok(response) => Ok(response),
-            Err(first_err) => {
-                self.drop_connection(peer).await;
-                tracing::debug!(target: "lil::rpc", %peer, "retrying RPC after connection error: {first_err}");
-                let connection = self.connection(peer).await?;
-                rpc_timeout(
-                    REQUEST_TIMEOUT,
-                    "RPC request retry",
-                    peer,
-                    round_trip_on_connection(&connection, peer, &request),
-                )
-                .await
-                .and_then(|result| result)
-            }
+            ResponseMessage::Ok { request_id: actual } if actual == request_id => Ok(()),
+            ResponseMessage::Error {
+                request_id: actual,
+                message,
+            } if actual == request_id => Err(io::Error::other(message)),
+            response => Err(io::Error::other(format!(
+                "unexpected Announce response from {peer}: {response:?}"
+            ))),
         }
     }
 
-    async fn connection(&self, peer: PublicKey) -> io::Result<Connection> {
-        {
-            let mut connections = self.connections.lock().await;
-            if let Some(cached) = connections.get(&peer) {
-                let stale = cached.connection.close_reason().is_some()
-                    || cached.created_at.elapsed() > MAX_CONNECTION_AGE;
-                if !stale {
-                    return Ok(cached.connection.clone());
-                }
-                tracing::debug!(target: "lil::rpc", %peer, "dropping stale cached connection");
-                connections.remove(&peer);
-            }
-        }
+    async fn round_trip(
+        &self,
+        peer: NodeId,
+        request: RequestMessage,
+    ) -> io::Result<ResponseMessage> {
+        let mut conn = self.connect(peer).await?;
+        rpc_timeout(REQUEST_TIMEOUT, "RPC request", peer, async {
+            conn.send_json(&request).await?;
+            conn.recv_json().await
+        })
+        .await
+    }
 
-        let connection = rpc_timeout(
+    async fn connect(&self, peer: NodeId) -> io::Result<NoiseConnection> {
+        let addr = self.wait_for_addr(peer).await?;
+        let conn = rpc_timeout(
             CONNECT_TIMEOUT,
             "connect",
             peer,
-            self.endpoint.connect(peer, ALPN),
+            NoiseConnection::connect(addr, &self.identity),
         )
-        .await?
-        .map_err(|err| io::Error::other(format!("connect to {peer}: {err}")))?;
-        let cached = CachedConnection {
-            connection: connection.clone(),
-            created_at: Instant::now(),
-        };
-        self.connections.lock().await.insert(peer, cached);
-        Ok(connection)
+        .await?;
+        if conn.peer() != peer {
+            return Err(io::Error::other(format!(
+                "connected to {addr}, expected {peer}, got {}",
+                conn.peer()
+            )));
+        }
+        Ok(conn)
     }
 
-    async fn drop_connection(&self, peer: PublicKey) {
-        self.connections.lock().await.remove(&peer);
+    async fn wait_for_addr(&self, peer: NodeId) -> io::Result<SocketAddr> {
+        let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+        loop {
+            if let Some(addr) = self.addresses.read().await.get(&peer).copied() {
+                return Ok(addr);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("peer {peer} not discovered by mDNS"),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 }
 
-impl ProtocolHandler for FolderRpc {
-    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        handle_connection(
-            connection,
-            Arc::clone(&self.state),
-            Arc::clone(&self.group),
-            Arc::clone(&self.invites_path),
-            self.events.clone(),
-        )
-        .await
-        .map_err(AcceptError::from_err)
-    }
+pub async fn spawn_server(
+    identity: Arc<Identity>,
+    state: Arc<RwLock<FolderState>>,
+    group: Arc<RwLock<GroupState>>,
+    invites_path: PathBuf,
+    events: mpsc::UnboundedSender<RpcEvent>,
+) -> io::Result<(u16, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind(("0.0.0.0", 0)).await?;
+    let port = listener.local_addr()?.port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, addr)) = listener.accept().await else {
+                continue;
+            };
+            let identity = Arc::clone(&identity);
+            let state = Arc::clone(&state);
+            let group = Arc::clone(&group);
+            let invites_path = invites_path.clone();
+            let events = events.clone();
+            tokio::spawn(async move {
+                if let Err(err) =
+                    handle_connection(stream, addr, identity, state, group, invites_path, events)
+                        .await
+                {
+                    tracing::warn!("rpc connection from {addr} failed: {err}");
+                }
+            });
+        }
+    });
+    Ok((port, handle))
 }
 
 async fn handle_connection(
-    connection: Connection,
+    stream: TcpStream,
+    addr: SocketAddr,
+    identity: Arc<Identity>,
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
-    invites_path: Arc<PathBuf>,
+    invites_path: PathBuf,
     events: mpsc::UnboundedSender<RpcEvent>,
 ) -> io::Result<()> {
-    let peer = connection.remote_id();
-    tracing::debug!(target: "lil::rpc", %peer, "incoming connection");
-
-    loop {
-        let (mut send, mut recv) = match connection.accept_bi().await {
-            Ok(streams) => streams,
-            Err(err) if is_routine_connection_close(&err) => {
-                tracing::debug!(target: "lil::rpc", %peer, "connection closed: {err}");
-                return Ok(());
-            }
-            Err(err) => return Err(io::Error::other(format!("accept bi stream: {err}"))),
-        };
-
-        let request: RequestMessage = read_frame(&mut recv)
-            .await
-            .map_err(|err| io::Error::other(format!("read request from {peer}: {err}")))?;
-        tracing::debug!(target: "lil::rpc", %peer, "recv {:?}", request);
-        assert_eof(&mut recv)
-            .await
-            .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
-
-        if let RequestMessage::GetObject {
-            request_id,
-            content_hash,
-        } = request
-        {
-            handle_get_object(&mut send, request_id, content_hash, peer, &state, &group).await?;
-        } else {
-            let response =
-                handle_request(request, peer, &state, &group, &invites_path, &events).await;
-            tracing::debug!(target: "lil::rpc", %peer, "send {:?}", response);
-            write_frame(&mut send, &response)
-                .await
-                .map_err(|err| io::Error::other(format!("write response to {peer}: {err}")))?;
-        }
-        close_send(&mut send)
-            .await
-            .map_err(|err| io::Error::other(format!("close response stream to {peer}: {err}")))?;
+    let mut conn = NoiseConnection::accept(stream, &identity).await?;
+    let peer = conn.peer();
+    tracing::debug!("incoming rpc peer={peer} addr={addr}");
+    let request: RequestMessage = conn.recv_json().await?;
+    if let RequestMessage::GetObject {
+        request_id,
+        content_hash,
+    } = request
+    {
+        handle_get_object(&mut conn, request_id, content_hash, peer, &state, &group).await
+    } else {
+        let response = handle_request(request, peer, &state, &group, &invites_path, &events).await;
+        conn.send_json(&response).await?;
+        let _ = conn.shutdown().await;
+        Ok(())
     }
 }
 
 async fn handle_get_object(
-    send: &mut iroh::endpoint::SendStream,
+    conn: &mut NoiseConnection,
     request_id: u64,
     content_hash: [u8; 32],
-    peer: PublicKey,
+    peer: NodeId,
     state: &Arc<RwLock<FolderState>>,
     group: &Arc<RwLock<GroupState>>,
 ) -> io::Result<()> {
     if !group.read().await.is_active_member(&peer) {
-        return write_frame(
-            send,
-            &ResponseMessage::Error {
-                request_id,
-                message: "peer is not a group member".to_string(),
-            },
-        )
-        .await;
+        conn.send_json(&ResponseMessage::Error {
+            request_id,
+            message: "peer is not a group member".to_string(),
+        })
+        .await?;
+        return Ok(());
     }
 
     let path = state.read().await.object_path(content_hash);
+    let Some(path) = path else {
+        conn.send_json(&ResponseMessage::Error {
+            request_id,
+            message: format!("object {} not found", hex(content_hash)),
+        })
+        .await?;
+        return Ok(());
+    };
 
-    match path {
-        None => {
-            write_frame(
-                send,
-                &ResponseMessage::Error {
-                    request_id,
-                    message: format!("object {} not found", hex(content_hash)),
-                },
-            )
-            .await
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|err| io::Error::other(format!("open {}: {err}", path.display())))?;
+    let size = file.metadata().await?.len();
+    conn.send_json(&ResponseMessage::ObjectHeader { request_id, size })
+        .await?;
+    let mut buf = vec![0_u8; max_plaintext_chunk()];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
         }
-        Some(path) => {
-            let mut file = tokio::fs::File::open(&path)
-                .await
-                .map_err(|err| io::Error::other(format!("open {}: {err}", path.display())))?;
-            let size = file.metadata().await?.len();
-            write_frame(send, &ResponseMessage::ObjectHeader { request_id, size }).await?;
-            tokio::io::copy(&mut file, send).await?;
-            Ok(())
-        }
+        conn.send_plain_chunk(&buf[..n]).await?;
     }
+    let _ = conn.shutdown().await;
+    Ok(())
 }
 
 async fn check_member(
     group: &Arc<RwLock<GroupState>>,
-    peer: PublicKey,
+    peer: NodeId,
     request_id: u64,
 ) -> Result<(), ResponseMessage> {
     if group.read().await.is_active_member(&peer) {
@@ -412,7 +396,7 @@ async fn check_member(
 
 async fn handle_request(
     request: RequestMessage,
-    peer: PublicKey,
+    peer: NodeId,
     state: &Arc<RwLock<FolderState>>,
     group: &Arc<RwLock<GroupState>>,
     invites_path: &Path,
@@ -439,7 +423,6 @@ async fn handle_request(
                             let _ = events.send(RpcEvent::PeerJoined { peer, name });
                             ResponseMessage::JoinAccepted {
                                 request_id,
-                                topic_id: hex(*group.topic_id().as_bytes()),
                                 members: group.members(),
                             }
                         }
@@ -491,122 +474,23 @@ async fn handle_request(
                 entry: state.entry(&path),
             }
         }
+        RequestMessage::Announce {
+            request_id,
+            message,
+        } => {
+            if let Err(e) = check_member(group, peer, request_id).await {
+                return e;
+            }
+            let _ = events.send(RpcEvent::Announcement { peer, message });
+            ResponseMessage::Ok { request_id }
+        }
         RequestMessage::GetObject { .. } => unreachable!("handled before handle_request"),
     }
 }
 
-async fn round_trip_on_connection(
-    connection: &Connection,
-    peer: PublicKey,
-    request: &RequestMessage,
-) -> io::Result<ResponseMessage> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|err| io::Error::other(format!("open stream to {peer}: {err}")))?;
-
-    write_frame(&mut send, &request)
-        .await
-        .map_err(|err| io::Error::other(format!("write request to {peer}: {err}")))?;
-    close_send(&mut send)
-        .await
-        .map_err(|err| io::Error::other(format!("close request stream to {peer}: {err}")))?;
-
-    let response = read_frame(&mut recv)
-        .await
-        .map_err(|err| io::Error::other(format!("read response from {peer}: {err}")))?;
-    assert_eof(&mut recv)
-        .await
-        .map_err(|err| io::Error::other(format!("trailing response from {peer}: {err}")))?;
-    Ok(response)
-}
-
-async fn get_object_to_file_on_connection(
-    connection: &Connection,
-    peer: PublicKey,
-    request_id: u64,
-    request: &RequestMessage,
-    expected_hash: [u8; 32],
-    expected_size: u64,
-    dest: &Path,
-) -> io::Result<()> {
-    let (mut send, mut recv) = rpc_timeout(
-        REQUEST_TIMEOUT,
-        "open object stream",
-        peer,
-        connection.open_bi(),
-    )
-    .await?
-    .map_err(|err| io::Error::other(format!("open stream to {peer}: {err}")))?;
-
-    rpc_timeout(
-        REQUEST_TIMEOUT,
-        "write object request",
-        peer,
-        write_frame(&mut send, request),
-    )
-    .await?
-    .map_err(|err| io::Error::other(format!("write request to {peer}: {err}")))?;
-    rpc_timeout(
-        REQUEST_TIMEOUT,
-        "close object request stream",
-        peer,
-        close_send(&mut send),
-    )
-    .await?
-    .map_err(|err| io::Error::other(format!("close request stream to {peer}: {err}")))?;
-
-    let header: ResponseMessage = rpc_timeout(
-        OBJECT_HEADER_TIMEOUT,
-        "read object header",
-        peer,
-        read_frame(&mut recv),
-    )
-    .await?
-    .map_err(|err| io::Error::other(format!("read object header from {peer}: {err}")))?;
-
-    let size = match header {
-        ResponseMessage::ObjectHeader {
-            request_id: actual,
-            size,
-        } if actual == request_id => size,
-        ResponseMessage::Error {
-            request_id: actual,
-            message,
-        } if actual == request_id => return Err(io::Error::other(message)),
-        response => {
-            return Err(io::Error::other(format!(
-                "unexpected GetObject response from {peer}: {response:?}"
-            )));
-        }
-    };
-
-    if size != expected_size {
-        return Err(io::Error::other(format!(
-            "object size mismatch from {peer}: expected {expected_size}, got {size}"
-        )));
-    }
-
-    let result = stream_to_file(peer, &mut recv, size, expected_hash, dest).await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(dest).await;
-    }
-    result?;
-
-    rpc_timeout(
-        REQUEST_TIMEOUT,
-        "read trailing object bytes",
-        peer,
-        assert_eof(&mut recv),
-    )
-    .await?
-    .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
-    Ok(())
-}
-
 async fn stream_to_file(
-    peer: PublicKey,
-    recv: &mut iroh::endpoint::RecvStream,
+    peer: NodeId,
+    conn: &mut NoiseConnection,
     size: u64,
     expected_hash: [u8; 32],
     dest: &Path,
@@ -614,26 +498,20 @@ async fn stream_to_file(
     let mut file = tokio::fs::File::create(dest).await?;
     let mut hasher = blake3::Hasher::new();
     let mut remaining = size;
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; max_plaintext_chunk()];
 
     while remaining > 0 {
         let to_read = (remaining as usize).min(buf.len());
-        let n = timeout(OBJECT_READ_IDLE_TIMEOUT, recv.read(&mut buf[..to_read]))
-            .await
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "object transfer from {peer} idle for {}s",
-                        OBJECT_READ_IDLE_TIMEOUT.as_secs()
-                    ),
-                )
-            })?
-            .map_err(io::Error::other)?
-            .ok_or_else(|| io::Error::other("unexpected EOF during object transfer"))?;
-        hasher.update(&buf[..n]);
-        file.write_all(&buf[..n]).await?;
-        remaining -= n as u64;
+        rpc_timeout(
+            OBJECT_READ_IDLE_TIMEOUT,
+            "object transfer",
+            peer,
+            conn.recv_plain_exact(&mut buf[..to_read]),
+        )
+        .await?;
+        hasher.update(&buf[..to_read]);
+        file.write_all(&buf[..to_read]).await?;
+        remaining -= to_read as u64;
     }
 
     file.sync_all().await?;
@@ -653,8 +531,8 @@ async fn stream_to_file(
 async fn rpc_timeout<T>(
     duration: Duration,
     operation: &str,
-    peer: PublicKey,
-    future: impl Future<Output = T>,
+    peer: NodeId,
+    future: impl Future<Output = io::Result<T>>,
 ) -> io::Result<T> {
     timeout(duration, future).await.map_err(|_| {
         io::Error::new(
@@ -664,14 +542,7 @@ async fn rpc_timeout<T>(
                 duration.as_secs()
             ),
         )
-    })
-}
-
-fn is_routine_connection_close(err: &ConnectionError) -> bool {
-    matches!(
-        err,
-        ConnectionError::ApplicationClosed(_) | ConnectionError::LocallyClosed
-    )
+    })?
 }
 
 #[cfg(test)]
@@ -680,9 +551,10 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_timeout_returns_timed_out_error() {
-        let peer = iroh::SecretKey::from_bytes(&[9; 32]).public();
+        let peer = NodeId::from_bytes([9; 32]);
         let err = rpc_timeout(Duration::from_millis(1), "test operation", peer, async {
             tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
         })
         .await
         .unwrap_err();

@@ -38,6 +38,7 @@ impl GossipMessage {
         serde_json::to_vec(self).expect("gossip message serialization should not fail")
     }
 
+    #[cfg(test)]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         serde_json::from_slice(bytes).ok()
     }

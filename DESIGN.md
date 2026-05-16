@@ -1,47 +1,58 @@
-# tngl Design
+# lil Design
 
 ## Goal
 
-`tngl` syncs a folder between a small, trusted group of nodes — for example,
-devices owned by the same person.
+`lil` syncs a folder between a small, trusted group of nodes on the same LAN.
+Every node keeps a full copy of the folder and a full membership ledger.
 
-`iroh-gossip` is used for low-latency change announcements. Direct
-`iroh` request/response RPCs are the authoritative data path. Gossip is a
-dissemination layer, not a replication engine.
+There is no central node, relay server, NAT traversal, or remote discovery.
+Discovery is local mDNS. Data transfer and announcements use direct
+Noise-encrypted TCP RPCs.
 
 ## Model
 
-Every node stores the complete member list. There is no partial membership
-view and no need for membership discovery beyond the initial join handshake.
+`peers.json` is the source of truth for group membership. A node is trusted only
+if it appears as active in the local membership ledger.
 
-`peers.json` holds everything needed to restart and rejoin the group: the
-gossip topic ID and the full peer list. It is the single source of truth for
-both sync peers and group membership.
-
-- `iroh-gossip` carries announcements only; no payload is trusted as an
-  authoritative write
-- direct `iroh` RPCs (`GetNodes` / `GetFiles`) are the source of truth for
-  all data transfer
-- every node knows every other node
+- mDNS maps active node IDs to LAN socket addresses.
+- direct RPCs are the source of truth for sync data.
+- announcements are a hint and repair trigger, not an authoritative write.
+- every active node fans announcements out to every other active node it can
+  currently discover.
 
 ## Non-Goals
 
-- Replace exact state sync with gossip
-- Trust gossiped payloads as authoritative writes
-- Implement decentralized membership discovery
+- Sync across NAT or the public internet.
+- Trust announcement payloads as authoritative writes.
+- Implement decentralized membership discovery beyond mDNS plus the explicit
+  join flow.
+
+## Identity And Transport
+
+Each node stores a 32-byte Ed25519 private key in `.lil/private.key`. The
+Ed25519 public key is the node ID.
+
+Peers establish a Noise `NN` session over TCP and then exchange signed identity
+payloads inside the encrypted session. The Ed25519 signature binds each node ID
+to the Noise handshake transcript, so the encrypted connection is associated
+with the same identity used by the membership ledger.
+
+## Discovery
+
+Running sync daemons advertise `_lilsync._tcp.local.` over mDNS with a TXT
+record containing their node ID. Browsers ignore their own ID and keep an
+in-memory address book from node ID to socket address.
+
+Discovery is intentionally LAN-only. If a peer is not visible over mDNS, RPCs to
+that peer time out instead of falling back to a relay.
 
 ## Sync Tree
 
-### Structure
+The sync tree is a path-based directory-mirroring Merkle tree. It provides:
 
-The sync tree is a path-based directory-mirroring Merkle tree (similar to git
-tree objects). It provides:
-
-- **A single root hash** describing the complete folder state — O(1) sync
-  check between two nodes.
-- **Locality**: a change to `src/foo/bar.rs` recomputes only the file leaf,
-  the `src/foo/` node, the `src/` node, and the root. Files elsewhere are
-  untouched.
+- **A single root hash** describing the complete folder state.
+- **Locality**: a change to `src/foo/bar.rs` recomputes only the file leaf, the
+  `src/foo/` node, the `src/` node, and the root.
 
 ### File Leaves
 
@@ -49,16 +60,13 @@ tree objects). It provides:
 leaf_hash = blake3(content_hash ++ lamport_le64 ++ changed_at_ms_le64 ++ origin_bytes)
 ```
 
-- `content_hash`: blake3 of file content; `TOMBSTONE_HASH` (`[0u8; 32]`) for deletions
-- `lamport_le64`: 8-byte little-endian lamport clock
-- `changed_at_ms_le64`: 8-byte little-endian wall-clock timestamp
-- `origin_bytes`: UTF-8 node ID of the originator
+- `content_hash`: BLAKE3 of file content; `TOMBSTONE_HASH` for deletions.
+- `lamport_le64`: 8-byte little-endian Lamport clock.
+- `changed_at_ms_le64`: 8-byte little-endian wall-clock timestamp.
+- `origin_bytes`: UTF-8 node ID of the originator.
 
-The lamport is included so a version bump — even with identical content —
-produces a different leaf hash.
-
-Deleted files (tombstones) remain as leaf nodes so removals and their lamport
-values propagate correctly during repair.
+Deleted files remain as tombstone leaves until garbage collection can prove the
+active peers have converged on the deletion.
 
 ### Directory Nodes
 
@@ -66,325 +74,126 @@ values propagate correctly during repair.
 dir_hash = blake3("name1\0" ++ hash1 ++ "name2\0" ++ hash2 ++ ...)
 ```
 
-Children (file leaves and subdirectory nodes) are sorted lexicographically by
-name. `\0` separates each name from its hash.
+Children are sorted lexicographically by name.
 
-### Root Node
+## RPCs
 
-The root is the directory node for the sync root. Two nodes with the same root
-hash are fully synchronized.
+All RPCs run over a fresh Noise-encrypted TCP connection.
 
-### Example
-
-```
-root
-├── README.md  (leaf)
-└── src/       (dir)
-    ├── lib.rs (leaf)
-    └── foo/   (dir)
-        ├── bar.rs (leaf)
-        └── baz.rs (leaf)
-```
-
-Editing `src/foo/bar.rs` recomputes: leaf → `src/foo/` → `src/` → root.
-`README.md`, `src/lib.rs`, and `src/foo/baz.rs` are untouched.
-
-## Sync RPCs
-
-### `GetNodes(path_prefix)`
-
-Returns the immediate children of the node at `path_prefix`:
-
-```json
-[
-  { "name": "foo",    "hash": "<blake3-hex>", "is_dir": true  },
-  { "name": "bar.rs", "hash": "<blake3-hex>", "is_dir": false }
-]
-```
-
-An empty `path_prefix` returns the root's children. The caller compares each
-child hash against its own tree: for differing directory nodes it recurses; for
-differing file leaves it collects the path for `GetFiles`.
-
-This walk is O(changed subtrees) — if two nodes differ only in `src/foo/`, the
-caller recurses into `src/` then `src/foo/` and stops.
-
-### `GetFiles(paths)`
-
-Returns streamed file metadata and content for each requested path.
-
-The response begins with:
-
-```json
-{ "request_id": 7, "count": 1 }
-```
-
-Then, for each file, the sender writes a `FileHeader` frame:
-
-```json
-{
-  "id": "src/foo/bar.rs",
-  "hash": "<blake3-hex>",
-  "lamport": 42,
-  "changed_at_ms": 1776330951115,
-  "origin": "<node-id>",
-  "size": 12345
-}
-```
-
-If `size > 0`, the sender streams exactly `size` raw content bytes immediately
-after that header. If `size == 0`, the entry is a tombstone and no content
-bytes follow.
-
-Used both for targeted fetches after a `FileChanged` announcement and as the
-final step of a repair walk. `ReplicatedEntry` is metadata-only; file content
-is streamed separately on the QUIC stream.
-
-## Change Paths
-
-### Live change
-
-1. Local filesystem event
-2. Update local state and sync tree
-3. Publish `FileChanged` to gossip topic
-4. Receiving peers: `should_accept_remote` check, then `GetFiles([id])` from origin
-
-### Repair (startup and periodic)
-
-1. Subscribe to gossip topic
-2. Publish `SyncState` (current root hash + lamport); also published on a
-   configurable interval (default 10 s) so out-of-sync peers self-repair
-3. Peers with a different root hash initiate a `GetNodes` tree walk
-4. Walk recurses into differing subtrees; collects differing files for `GetFiles`
-
-## Gossip Messages
-
-All messages carry `"origin"` (publishing node ID) and a `"kind"` tag.
-
-### `FileChanged`
-
-Published on every local file write or deletion. No debouncing.
-
-```json
-{
-  "kind": "file-changed",
-  "origin": "<node-id>",
-  "id": "src/foo/bar.rs",
-  "hash": "<blake3-hex>",
-  "lamport": 42,
-  "changed_at_ms": 1776330951115
-}
-```
-
-`hash` and `lamport` are enough for `should_accept_remote` before any network IO.
-
-### `SyncState`
-
-Published on startup and periodically (default every 10 seconds, configurable
-with `--sync-state-interval`).
-
-```json
-{
-  "kind": "sync-state",
-  "origin": "<node-id>",
-  "root_hash": "<blake3-hex>",
-  "lamport": 284
-}
-```
-
-A receiver with a different `root_hash` schedules a full tree sync against `origin`.
-
-### `MemberList`
-
-Published after join or removal, and periodically by every node. Carries the
-complete membership ledger — both active and removed members — so a single
-message conveys the full group state.
-
-```json
-{
-  "kind": "member-list",
-  "origin": "<node-id>",
-  "members": [
-    { "id": "<node-id>", "status": "active",  "lamport": 42  },
-    { "id": "<node-id>", "status": "removed", "lamport": 105 }
-  ]
-}
-```
-
-The `members` list includes the publisher itself.
-
-Merge rule: for each entry, apply if `entry.lamport > local recorded lamport
-for that id`. This handles additions and removals identically. A stale
-broadcast cannot undo a more recent status change.
-
-A node that sees itself listed as `"removed"` unsubscribes from the topic and
-stops publishing.
-
-## Gossip Receiver Behavior
-
-```
-receive gossip message
-│
-├─ sender not in member list → drop
-│   (exception: MemberList from a bootstrap peer before local list is populated)
-│
-├─ FileChanged
-│   ├─ should_accept_remote(local_entry, announced)? → no: drop
-│   └─ yes: GetFiles([id]) from origin
-│             └─ RPC fails: fall back to full tree sync against origin
-│
-├─ SyncState
-│   ├─ local root hash == announced root_hash? → drop
-│   └─ differs: schedule full tree sync against origin
-│
-└─ MemberList
-    └─ for each entry { id, status, lamport }:
-          entry.lamport <= local recorded lamport for id? → skip
-          else: update local record with { status, lamport }
-                status == "active"?  → add to peer list; schedule sync if new
-                status == "removed"? → remove from peer list
-                                       id == self? → unsubscribe, stop publishing
-```
-
-## Authorization
-
-- Accept sync RPCs only from nodes in the local member list.
-- Treat gossip announcements as actionable only from nodes in the local member
-  list.
-- Gossip does not create trust. Hearing from a node over gossip is not enough
-  to add it to the member list.
-
-## State Files
-
-All state lives in `<sync-folder>/.tngl/`:
-
-| File | Contents |
+| RPC | Purpose |
 |---|---|
-| `iroh.key` | 32-byte ed25519 secret key |
-| `daemon.cache` | rkyv-serialized entry map (mtime cache for fast startup) |
-| `peers.json` | group state: `topic_id` + peer list |
-| `pending_invites.json` | outstanding invite tokens with expiry |
+| `Join` | Consume an invite token and return the full member ledger |
+| `GetRoot` | Read a peer's state root, live root, and Lamport clock |
+| `GetNode` | Read one Merkle tree node by path prefix |
+| `GetEntry` | Read one replicated entry by path |
+| `GetObject` | Stream file content by content hash |
+| `Announce` | Deliver a sync-state, filesystem-changed, or peers announcement |
 
-### `peers.json` schema
+File content is streamed in encrypted chunks. The receiver verifies the BLAKE3
+hash before installing a downloaded object.
 
-```json
-{
-  "topic_id": "<iroh-gossip topic hex>",
-  "members": [
-    { "id": "<node-id>", "status": "active",  "lamport": 42  },
-    { "id": "<node-id>", "status": "removed", "lamport": 105 }
-  ]
-}
-```
+## Announcements
 
-- `topic_id`: absent until the node has joined a group
-- `members`: full membership ledger, including self and removed members
-
-`MemberList` gossip keeps `peers.json` consistent across nodes. On any
-membership change a `MemberList` is broadcast; receivers update their own
-`peers.json` accordingly.
-
-## Membership
-
-### Invite ticket
-
-Issued by an existing member. Encoded as `<node-id>:<32-byte-hex-token>`.
-
-### Join RPC
-
-`JoinRequest` (joiner → inviter):
-```json
-{ "token": "<hex>", "joiner_id": "<node-id>" }
-```
-
-`JoinAccepted` (inviter → joiner):
-```json
-{ "topic_id": "<hex-or-null>", "members": ["<node-id>", ...] }
-```
-
-`members` is the complete group including the inviter itself. The joiner strips
-its own ID and saves the rest as peers.
-
-`JoinRejected` (inviter → joiner):
-```json
-{ "reason": "invalid or expired token" }
-```
-
-Tokens are single-use. `topic_id` and `members` come from the inviter, not the
-ticket, so they are always fresh.
-
-### Join flow
-
-1. Joiner connects to `host_id`, sends `JoinRequest`
-2. Inviter validates token (consumes it)
-3. Inviter adds joiner to its member list
-4. Inviter sends `JoinAccepted` with `topic_id` and full member list (including self)
-5. Inviter publishes updated `MemberList` to the topic
-6. Joiner writes the full member list (including self) to `peers.json`
-7. Joiner subscribes to topic, publishes `SyncState`
-8. Joiner starts pull sync from inviter
-
-### Member removal
-
-Any node can remove any other node (access control to be refined). The removing
-node marks the member as `"removed"` in its ledger, saves `peers.json`, and
-broadcasts an updated `MemberList`. All peers apply the same merge rule.
-
-## Startup Optimization
-
-`daemon.cache` stores each entry's `mtime_ms` alongside its hash. On startup,
-files whose filesystem mtime matches the cached value are returned directly
-without re-hashing. Only files with changed mtime are rehashed.
-
-## Risks
-
-### Bootstrap fragility
-
-If a node's only known peer disappears, reconnecting to the group is difficult.
-Mitigation: store several bootstrap peers; future: bootstrap from topic.
-
-### Authorization drift
-
-Member lists are persisted independently and may diverge if a node is offline
-during a membership change. Periodic `MemberList` broadcasts repair this on
-reconnect.
-
-### Announcement storms
-
-High write volume generates many `FileChanged` messages. Receivers deduplicate
-cheaply via `should_accept_remote` before any I/O. `iroh-gossip` handles
-transport-level deduplication.
-
-## Summary
-
-### Gossip messages
+Announcements are sent by LAN fanout RPC to active peers. They carry an
+`origin` node ID and are accepted only if the origin is active in the local
+member ledger.
 
 | Message | Published by | When |
 |---|---|---|
-| `FileChanged` | any node | on every local write or deletion |
+| `FilesystemChanged` | any node | after local filesystem changes |
 | `SyncState` | any node | on startup and periodically |
-| `MemberList` | any node | after join/removal and periodically |
+| `Peers` | any node | after join/removal and periodically |
 
-### Sync RPCs
+Receivers use announcements as hints:
 
-| RPC | Arguments | Returns |
-|---|---|---|
-| `GetNodes` | `path_prefix: String` | `[{name, hash, is_dir}]` |
-| `GetFiles` | `ids: Vec<String>` | `FilesBegin { count }`, then `count` streamed `FileHeader` + content payloads |
+- a different root schedules a Merkle reconciliation against the origin.
+- a filesystem hint can reduce the tree walk to changed prefixes.
+- a peers announcement merges newer member ledger entries.
 
-### Key decisions
+## Membership
 
-- **Small trusted group**: every node stores the complete peer list
-- **`peers.json` is restart state**: holds `topic_id` + peer list; no separate group config
-- **`MemberList` is the full ledger**: active + removed members with per-entry lamports; uniform merge rule; no separate join/remove messages
-- **`MemberList` includes self**: the publisher includes its own entry so receivers have a complete picture
-- **`JoinAccepted.members` includes inviter**: joiner saves the full list (including self) as the membership ledger
-- **Topic = group identity**: no separate group name
-- **Minimal ticket**: `<node-id>:<token>` only; group state comes from `JoinAccepted`
-- **No debouncing**: every write produces one `FileChanged`; deduplication at receiver
-- **Gossip for announcements only**: all data transfer over direct RPC
-- **Path-based Merkle tree**: O(1) root hash comparison; O(depth) updates per file change
-- **`GetNodes` walk is the repair path**: recurses only into differing subtrees
-- **Leaf hash includes lamport**: version changes detected even when content is identical
-- **Tombstones in the tree**: deleted files remain as leaves so removals propagate during repair
-- **mtime cache**: startup skips rehashing files whose mtime is unchanged
+### Invite Ticket
+
+An existing member creates an invite token and stores it in `.lil/invites.json`.
+The ticket encodes the issuer node ID and the token secret. Tokens are
+single-use and expire.
+
+### Join Flow
+
+1. Joiner discovers the issuer by node ID over mDNS.
+2. Joiner connects to the issuer and sends `Join`.
+3. Issuer consumes the invite token.
+4. Issuer adds the joiner to its member ledger.
+5. Issuer returns the full member ledger.
+6. Joiner writes that ledger to `.lil/peers.json`.
+7. If not started with `--exit`, the joiner starts its sync daemon and begins
+   advertising itself over mDNS.
+
+### Member Removal
+
+Any node can mark another member as removed. Removed entries remain in the
+ledger with their Lamport values so stale announcements cannot resurrect old
+members. Remaining peers apply the removal when they receive a newer `Peers`
+announcement or reconnect and reconcile.
+
+## Tombstone Garbage Collection
+
+Deletes are retained as tombstones until active peers have reported matching
+roots for the deletion. Each node also persists a GC watermark in
+`.lil/gc-watermark.bin` so old versions cannot be reintroduced after restart.
+
+When active peers converge on the same root, tombstones covered by the
+converged watermark can be pruned and the new state is announced.
+
+## State Files
+
+All state lives in `<sync-folder>/.lil/`:
+
+| File | Contents |
+|---|---|
+| `private.key` | 32-byte Ed25519 private key |
+| `daemon.lock` | exclusive sync process lock |
+| `peers.json` | full membership ledger |
+| `invites.json` | outstanding invite tokens with expiry |
+| `entries.bin` | persisted replicated entry index |
+| `lamport` | persisted Lamport clock |
+| `gc-watermark.bin` | persisted tombstone GC watermark |
+
+### `peers.json` Schema
+
+```json
+{
+  "members": [
+    { "id": "<node-id>", "status": "active", "lamport": 42, "name": "macbook" },
+    { "id": "<node-id>", "status": "removed", "lamport": 105, "name": null }
+  ]
+}
+```
+
+Older files may contain a `topic_id` field from the previous transport. It is
+ignored and omitted on the next save.
+
+## Risks
+
+### LAN-Only Availability
+
+Peers cannot sync unless they are on the same LAN and visible over mDNS. This
+is an intentional trade-off after removing relay and NAT traversal support.
+
+### Authorization Drift
+
+Member lists are persisted independently and may diverge while a node is
+offline. Periodic `Peers` announcements repair this when nodes are online
+together.
+
+### Announcement Fanout
+
+Every announcement is sent directly to every active peer. This is simple and
+works for small groups, but large groups or high write volume can produce many
+short TCP connections.
+
+### Backward Compatibility
+
+Existing data and private keys are reused, but peer IDs are now stored as raw
+Ed25519 public-key hex strings. Very old `peers.json` files that only contain
+transport-specific node ID encodings may need to be rejoined.

@@ -1,81 +1,77 @@
 # Security Assessment
 
-`lil` is designed for syncing folders between a small group of trusted nodes
-(e.g. your own devices). This document describes the threat model and known
-limitations.
+`lil` is designed for syncing folders between a small group of trusted nodes on
+the same LAN, such as your own devices. This document describes the threat model
+and known limitations.
 
 ## Threat Model
 
 `lil` is **not** designed to defend against a compromised group member, a
 compromised machine, or a sophisticated adversary with physical access to any
-node. It is designed to be safe against outsiders who have only network access.
+node. It is designed to be safe against outsiders who have only LAN network
+access.
 
 ## Attack Surface
 
 ### File content — strong protection
 
-An outsider cannot read your files.
+An outsider cannot read your files passively.
 
-All connections use QUIC with TLS, authenticated by Ed25519 node keys. Passive
-network sniffing yields nothing. File transfer RPCs are gated by an allowlist
-built from the membership ledger in `peers.json`. An outsider who connects has
-their request silently dropped at the application layer.
+Peers discover each other with mDNS, then communicate over TCP encrypted with
+Noise. Each side proves its Ed25519 node identity inside the encrypted
+handshake transcript. File transfer RPCs are gated by the membership ledger in
+`peers.json`; a non-member can connect, but its requests are rejected before
+any file data is sent.
 
 The realistic paths to file content are:
 
 - **Invite token interception**: tokens are single-use and time-limited, but if
-  transmitted insecurely (e.g. over plaintext chat) an attacker could use one
-  before the intended recipient. Share invite tokens over an already-secure
-  channel.
+  transmitted insecurely an attacker on the LAN could use one before the
+  intended recipient. Share invite tokens over an already-secure channel.
 - **Key file theft**: stealing `.lil/private.key` from a compromised machine
   allows impersonating that node. This requires physical or OS-level access.
 
-### File metadata — partial exposure
+### File metadata — LAN-visible announcements
 
-Anyone who knows the gossip `topic_id` and any member's node ID can subscribe
-to the gossip topic and receive `FilesystemChanged` messages (file paths and
-BLAKE3 content hashes) and `Peers` messages (all member node IDs). They cannot
-retrieve file content, but they learn what files exist and when they change.
+Announcements are delivered by direct LAN fanout to active peers. Announcement
+payloads include node IDs, state roots, Lamport clocks, and bounded tree hints
+for filesystem changes. They are encrypted in transit, but any current group
+member can see them.
 
-The `topic_id` is not publicly advertised — it is only distributed through the
-join handshake — but it is stored in plaintext in `.lil/peers.json`. A
-compromised machine exposes it.
+Removed members stop receiving new announcements once remaining peers have
+applied the removal. A removed member that still has a valid old key cannot
+download file content from peers that have the removal in their local member
+ledger.
 
-Removed members retain the `topic_id` they already know and can continue to
-observe gossip metadata indefinitely. They cannot access file content because
-they are removed from the allowlist on all remaining nodes.
+### Discovery metadata — LAN-visible service records
 
-### Relay server visibility — low, by design
+mDNS advertises that a node is running the `lilsync` service, its TCP port, and
+its node ID. Anyone on the LAN can observe those service records. There is no
+relay metadata exposure because `lil` does not use relays.
 
-`lil` uses [iroh](https://www.iroh.computer) relay servers for NAT traversal.
-Relay servers forward encrypted QUIC packets and cannot decrypt them, but they
-can observe which node IDs are communicating with each other. This is a
-metadata leak to iroh's infrastructure that is inherent to the current
-architecture. Support for private relay servers is out of scope for now.
+### Denial of service — lightly mitigated
 
-### Denial of service — not mitigated
-
-The iroh endpoint accepts inbound QUIC connections from any peer. Non-member
-connections are dropped after reading the first frame, but there is no rate
-limiting or connection cap. A targeted flood could exhaust file descriptors or
-CPU. This is unlikely against a personal sync tool but is not mitigated.
+The TCP listener accepts inbound connections from the LAN. Handshakes and RPCs
+have timeouts, and non-member requests are rejected, but there is no global rate
+limit or connection cap. A targeted LAN flood could still exhaust file
+descriptors or CPU.
 
 ## Summary
 
 | Threat | Risk | Status |
 |---|---|---|
-| Passive network sniffing | None | QUIC/TLS encryption |
-| Unauthorized file download | Very low | Allowlist on all RPCs |
+| Passive network sniffing | Low | Noise encryption after mDNS discovery |
+| Unauthorized file download | Very low | Membership allowlist on all file RPCs |
 | Invite token interception | Low–medium | Single-use, time-limited; depends on how it is shared |
-| Key file theft (private.key) | Low | Requires physical or OS-level access |
-| Gossip metadata snooping | Low–medium | topic_id secrecy; no cryptographic membership gate on gossip |
-| Relay metadata observation | Low | Architectural trade-off; accepted |
-| DoS via connection flood | Low | Not mitigated |
+| Key file theft (`private.key`) | Low | Requires physical or OS-level access |
+| LAN service discovery metadata | Low | mDNS exposes node ID and port locally |
+| Removed-member metadata access | Low | Stops after peers learn the removal |
+| DoS via connection flood | Low–medium | Per-operation timeouts; no rate limit |
 
 ## Files to Protect
 
 | File | Secret | Consequence if leaked |
 |---|---|---|
 | `.lil/private.key` | Node identity key | Attacker can impersonate this node |
-| `.lil/peers.json` | Contains `topic_id` and member node IDs | Attacker can subscribe to gossip and observe file metadata |
+| `.lil/peers.json` | Member node IDs and status ledger | Attacker learns group membership |
 | Invite tokens | Printed to stdout at generation time | Attacker can join the group if used before the intended recipient |
