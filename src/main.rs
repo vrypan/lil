@@ -202,6 +202,7 @@ async fn run_sync(
         Arc::new(RwLock::new(s))
     };
     let root_reports = Arc::new(RwLock::new(RootReports::default()));
+    let downloads = sync::DownloadCoordinator::default();
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
     let (rpc_event_tx, mut rpc_event_rx) = mpsc::unbounded_channel();
@@ -311,6 +312,7 @@ async fn run_sync(
                             Arc::clone(&state),
                             Arc::clone(&group),
                             Arc::clone(&root_reports),
+                            downloads.clone(),
                             &local_origin,
                         ).await?;
                     }
@@ -546,6 +548,7 @@ async fn handle_announcement(
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
     root_reports: Arc<RwLock<RootReports>>,
+    downloads: sync::DownloadCoordinator,
     local_origin: &str,
 ) -> io::Result<()> {
     if message.origin() == local_origin {
@@ -587,11 +590,14 @@ async fn handle_announcement(
         _ => maybe_probe_remote_rpc(
             rpc_client.clone(),
             message,
-            state,
-            Arc::clone(&group),
-            root_reports,
-            rpc_client,
-            local_origin.to_string(),
+            ProbeShared {
+                state,
+                group: Arc::clone(&group),
+                root_reports,
+                downloads,
+                publisher: rpc_client,
+                local_origin: local_origin.to_string(),
+            },
         ),
     }
     Ok(())
@@ -751,15 +757,16 @@ fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
     }
 }
 
-fn maybe_probe_remote_rpc(
-    rpc_client: rpc::RpcClient,
-    message: GossipMessage,
+struct ProbeShared {
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
     root_reports: Arc<RwLock<RootReports>>,
+    downloads: sync::DownloadCoordinator,
     publisher: rpc::RpcClient,
     local_origin: String,
-) {
+}
+
+fn maybe_probe_remote_rpc(rpc_client: rpc::RpcClient, message: GossipMessage, shared: ProbeShared) {
     let (origin, remote_state_root, remote_live_root, remote_lamport, hint, use_advertised_root) =
         match message {
             GossipMessage::SyncState {
@@ -786,7 +793,7 @@ fn maybe_probe_remote_rpc(
 
     tokio::spawn(async move {
         let local = {
-            let state = state.read().await;
+            let state = shared.state.read().await;
             StateSnapshot::from_state(&state)
         };
 
@@ -796,12 +803,15 @@ fn maybe_probe_remote_rpc(
             } else if use_advertised_root {
                 match sync::reconcile_with_advertised_root(
                     rpc_client,
-                    Arc::clone(&state),
+                    Arc::clone(&shared.state),
                     peer,
-                    remote_state_root,
-                    remote_live_root,
-                    remote_lamport,
-                    hint,
+                    sync::RemoteRoot {
+                        state_root: remote_state_root,
+                        live_root: remote_live_root,
+                        lamport: remote_lamport,
+                        hint,
+                    },
+                    shared.downloads.clone(),
                 )
                 .await
                 {
@@ -809,7 +819,14 @@ fn maybe_probe_remote_rpc(
                     Err(err) => Err(err),
                 }
             } else {
-                match sync::reconcile_with_peer(rpc_client, Arc::clone(&state), peer).await {
+                match sync::reconcile_with_peer(
+                    rpc_client,
+                    Arc::clone(&shared.state),
+                    shared.downloads.clone(),
+                    peer,
+                )
+                .await
+                {
                     Ok(changes) => Ok(Some(changes)),
                     Err(err) => Err(err),
                 }
@@ -823,10 +840,16 @@ fn maybe_probe_remote_rpc(
             Ok(Some(changes)) => {
                 tracing::info!("sync peer={} applied {} changes", peer, changes.len());
                 let snapshot = {
-                    let state = state.read().await;
+                    let state = shared.state.read().await;
                     StateSnapshot::from_state(&state)
                 };
-                publish_sync_state(&publisher, Arc::clone(&group), &snapshot, &local_origin).await;
+                publish_sync_state(
+                    &shared.publisher,
+                    Arc::clone(&shared.group),
+                    &snapshot,
+                    &shared.local_origin,
+                )
+                .await;
             }
             Err(err) => {
                 tracing::warn!("sync peer={} failed: {err}", peer);
@@ -835,11 +858,11 @@ fn maybe_probe_remote_rpc(
         }
 
         maybe_gc_tombstones(
-            Arc::clone(&state),
-            Arc::clone(&group),
-            Arc::clone(&root_reports),
-            &publisher,
-            &local_origin,
+            Arc::clone(&shared.state),
+            Arc::clone(&shared.group),
+            Arc::clone(&shared.root_reports),
+            &shared.publisher,
+            &shared.local_origin,
         )
         .await;
     });

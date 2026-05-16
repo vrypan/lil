@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Duration, SystemTime};
 
 const STATE_DIR: &str = ".lil";
 const IGNORE_FILE_NAME: &str = ".nolil";
@@ -15,6 +17,10 @@ const IGNORED_DIR_NAMES: &[&str] = &[
     "$RECYCLE.BIN",
     "lost+found",
 ];
+const FILE_STABLE_AGE: Duration = Duration::from_secs(1);
+const FILE_STABILITY_PAUSE: Duration = Duration::from_millis(250);
+const FILE_STABILITY_ATTEMPTS: usize = 8;
+static NEXT_RECV_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -109,6 +115,17 @@ pub struct TreeSnapshot {
 
 pub type GcWatermark = BTreeMap<String, u64>;
 
+struct ScanResult {
+    entries: BTreeMap<String, Entry>,
+    unstable: BTreeSet<String>,
+}
+
+struct ObservedFile {
+    content_hash: [u8; 32],
+    size: u64,
+    mode: Option<u32>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 struct LegacyEntry {
     path: String,
@@ -149,6 +166,7 @@ impl FolderState {
         let root = fs::canonicalize(root)?;
         let state_dir = root.join(STATE_DIR);
         fs::create_dir_all(&state_dir)?;
+        cleanup_recv_files(&state_dir);
         let saved_lamport = load_saved_lamport(&state_dir);
         let gc_watermark = load_gc_watermark(&state_dir);
         let saved_entries = load_saved_entries(&state_dir);
@@ -208,10 +226,10 @@ impl FolderState {
         self.entries.get(path.trim_matches('/')).cloned()
     }
 
-    pub fn object_path(&self, content_hash: [u8; 32]) -> Option<PathBuf> {
+    pub fn object_file(&self, content_hash: [u8; 32]) -> Option<(PathBuf, u64)> {
         self.entries.values().find_map(|entry| {
             if entry.kind == EntryKind::File && entry.content_hash == Some(content_hash) {
-                Some(self.root.join(&entry.path))
+                Some((self.root.join(&entry.path), entry.size))
             } else {
                 None
             }
@@ -232,8 +250,11 @@ impl FolderState {
     }
 
     pub fn tmp_recv_path(&self, entry: &Entry) -> PathBuf {
+        let id = NEXT_RECV_ID.fetch_add(1, AtomicOrdering::Relaxed);
         self.root.join(STATE_DIR).join(format!(
-            "recv-{}-{}",
+            "recv-{}-{}-{}-{}",
+            std::process::id(),
+            id,
             entry.version.lamport,
             entry.path.replace('/', "_")
         ))
@@ -336,9 +357,9 @@ impl FolderState {
         let ignore_patterns = load_ignore_patterns(&self.root)?;
         let live = scan_folder(&self.root)?;
         let mut changes = Vec::new();
-        let mut seen = BTreeSet::new();
+        let mut seen = live.unstable;
 
-        for (path, live_entry) in live {
+        for (path, live_entry) in live.entries {
             seen.insert(path.clone());
             self.update_entry(&path, live_entry, &mut changes);
         }
@@ -436,13 +457,17 @@ impl FolderState {
                 }
             }
             Ok(metadata) if metadata.is_file() => {
+                let Some(observed) = observe_file_when_stable(abs_path, metadata, true)? else {
+                    tracing::debug!("file still changing; skipping {relative}");
+                    return Ok(());
+                };
                 let live = Entry {
                     path: relative.to_string(),
                     kind: EntryKind::File,
-                    content_hash: Some(hash_file(abs_path)?),
+                    content_hash: Some(observed.content_hash),
                     symlink_target: None,
-                    size: metadata.len(),
-                    mode: mode(&metadata),
+                    size: observed.size,
+                    mode: observed.mode,
                     version: placeholder_version(),
                 };
                 self.update_entry(relative, live, changes);
@@ -459,7 +484,14 @@ impl FolderState {
                 };
                 self.update_entry(relative, live, changes);
                 let mut dir_entries = BTreeMap::new();
-                scan_dir(&self.root, abs_path, ignore_patterns, &mut dir_entries)?;
+                let mut unstable = BTreeSet::new();
+                scan_dir(
+                    &self.root,
+                    abs_path,
+                    ignore_patterns,
+                    &mut dir_entries,
+                    &mut unstable,
+                )?;
                 for (path, live) in dir_entries {
                     self.update_entry(&path, live, changes);
                 }
@@ -651,6 +683,25 @@ fn load_saved_entries(state_dir: &Path) -> BTreeMap<String, Entry> {
         .unwrap_or_default()
 }
 
+fn cleanup_recv_files(state_dir: &Path) {
+    let Ok(entries) = fs::read_dir(state_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("recv-") {
+            continue;
+        }
+        if let Err(err) = remove_path_if_exists(&entry.path()) {
+            tracing::debug!(
+                "failed to remove stale receive file {:?}: {}",
+                entry.path(),
+                err
+            );
+        }
+    }
+}
+
 fn load_saved_lamport(state_dir: &Path) -> u64 {
     fs::read(state_dir.join("lamport"))
         .ok()
@@ -804,11 +855,12 @@ impl TreeSnapshot {
     }
 }
 
-fn scan_folder(root: &Path) -> io::Result<BTreeMap<String, Entry>> {
+fn scan_folder(root: &Path) -> io::Result<ScanResult> {
     let mut entries = BTreeMap::new();
+    let mut unstable = BTreeSet::new();
     let ignore_patterns = load_ignore_patterns(root)?;
-    scan_dir(root, root, &ignore_patterns, &mut entries)?;
-    Ok(entries)
+    scan_dir(root, root, &ignore_patterns, &mut entries, &mut unstable)?;
+    Ok(ScanResult { entries, unstable })
 }
 
 fn scan_dir(
@@ -816,6 +868,7 @@ fn scan_dir(
     dir: &Path,
     ignore_patterns: &[IgnorePattern],
     entries: &mut BTreeMap<String, Entry>,
+    unstable: &mut BTreeSet<String>,
 ) -> io::Result<()> {
     let mut children = Vec::new();
     for child in fs::read_dir(dir)? {
@@ -863,17 +916,22 @@ fn scan_dir(
                     version: placeholder_version(),
                 },
             );
-            scan_dir(root, &path, ignore_patterns, entries)?;
+            scan_dir(root, &path, ignore_patterns, entries, unstable)?;
         } else if metadata.is_file() {
+            let Some(observed) = observe_file_when_stable(&path, metadata, false)? else {
+                tracing::debug!("file still changing; skipping {relative}");
+                unstable.insert(relative);
+                continue;
+            };
             entries.insert(
                 relative.clone(),
                 Entry {
                     path: relative,
                     kind: EntryKind::File,
-                    content_hash: Some(hash_file(&path)?),
+                    content_hash: Some(observed.content_hash),
                     symlink_target: None,
-                    size: metadata.len(),
-                    mode,
+                    size: observed.size,
+                    mode: observed.mode,
                     version: placeholder_version(),
                 },
             );
@@ -937,6 +995,59 @@ fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
         hasher.update(&buffer[..read]);
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+fn observe_file_when_stable(
+    path: &Path,
+    mut before: fs::Metadata,
+    wait_for_recent: bool,
+) -> io::Result<Option<ObservedFile>> {
+    for attempt in 0..FILE_STABILITY_ATTEMPTS {
+        if wait_for_recent && is_recently_modified(&before) {
+            std::thread::sleep(FILE_STABILITY_PAUSE);
+            let after_pause = fs::symlink_metadata(path)?;
+            if !after_pause.is_file() {
+                return Ok(None);
+            }
+            before = after_pause;
+            continue;
+        }
+
+        let content_hash = hash_file(path)?;
+        let after_hash = fs::symlink_metadata(path)?;
+        if !after_hash.is_file() {
+            return Ok(None);
+        }
+        if same_file_observation(&before, &after_hash) {
+            return Ok(Some(ObservedFile {
+                content_hash,
+                size: after_hash.len(),
+                mode: mode(&after_hash),
+            }));
+        }
+
+        before = after_hash;
+        if attempt + 1 < FILE_STABILITY_ATTEMPTS {
+            std::thread::sleep(FILE_STABILITY_PAUSE);
+        }
+    }
+    Ok(None)
+}
+
+fn same_file_observation(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && mode(left) == mode(right)
+}
+
+fn is_recently_modified(metadata: &fs::Metadata) -> bool {
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age < FILE_STABLE_AGE)
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -1658,6 +1769,43 @@ mod tests {
         assert_eq!(fs::read(tmp.path().join("remote.txt")).unwrap(), bytes);
         assert_eq!(state.entry("remote.txt").unwrap().version.lamport, 10);
         assert_eq!(state.lamport(), 10);
+    }
+
+    #[test]
+    fn receive_temp_paths_are_unique_per_attempt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let entry = Entry {
+            path: "large.zip".to_string(),
+            kind: EntryKind::File,
+            content_hash: Some([1; 32]),
+            symlink_target: None,
+            size: 100,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        assert_ne!(state.tmp_recv_path(&entry), state.tmp_recv_path(&entry));
+    }
+
+    #[test]
+    fn object_file_uses_indexed_size_when_live_file_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("large.zip");
+        fs::write(&file, "old").unwrap();
+        let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let entry = state.entry("large.zip").unwrap();
+        let hash = entry.content_hash.unwrap();
+
+        fs::write(&file, "old plus more bytes").unwrap();
+
+        let (path, size) = state.object_file(hash).unwrap();
+        assert_eq!(path, fs::canonicalize(&file).unwrap());
+        assert_eq!(size, entry.size);
+        assert_ne!(fs::metadata(path).unwrap().len(), size);
     }
 
     #[test]

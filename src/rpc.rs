@@ -360,8 +360,8 @@ async fn handle_get_object(
         return Ok(());
     }
 
-    let path = state.read().await.object_path(content_hash);
-    let Some(path) = path else {
+    let object = state.read().await.object_file(content_hash);
+    let Some((path, expected_size)) = object else {
         conn.send_json(&ResponseMessage::Error {
             request_id,
             message: format!("object {} not found", hex(content_hash)),
@@ -374,6 +374,17 @@ async fn handle_get_object(
         .await
         .map_err(|err| io::Error::other(format!("open {}: {err}", path.display())))?;
     let size = file.metadata().await?.len();
+    if size != expected_size {
+        conn.send_json(&ResponseMessage::Error {
+            request_id,
+            message: format!(
+                "object {} changed before transfer: expected {expected_size} bytes, got {size}",
+                hex(content_hash)
+            ),
+        })
+        .await?;
+        return Ok(());
+    }
     conn.send_json(&ResponseMessage::ObjectHeader { request_id, size })
         .await?;
     let mut buf = vec![0_u8; max_plaintext_chunk()];
