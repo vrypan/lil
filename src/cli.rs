@@ -15,6 +15,17 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn daemon_log_path(&self) -> Option<std::path::PathBuf> {
+        match &self.command {
+            Command::Sync {
+                folder,
+                daemon: true,
+                ..
+            } => Some(folder.join(".lil").join("sync.log")),
+            _ => None,
+        }
+    }
+
     pub fn status_mode(&self) -> bool {
         matches!(
             self.command,
@@ -49,6 +60,9 @@ pub enum Command {
         /// Show a quiet peer status view instead of regular info logs
         #[arg(long)]
         status: bool,
+        /// Fork into the background and write logs to <folder>/.lil/sync.log
+        #[arg(long)]
+        daemon: bool,
     },
     /// Create a one-time join ticket and exit
     Invite {
@@ -84,6 +98,11 @@ pub enum Command {
     /// List known peers
     Peers {
         /// Folder whose group to inspect
+        folder: PathBuf,
+    },
+    /// Stop a running daemon
+    Stop {
+        /// Folder whose daemon to stop
         folder: PathBuf,
     },
     /// Dump stored sync state entries as JSON lines

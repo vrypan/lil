@@ -15,6 +15,7 @@ use std::sync::Arc;
 pub const KEY_FILE: &str = "private.key";
 pub const PEERS_FILE: &str = "peers.json";
 pub const INVITES_FILE: &str = "invites.json";
+pub const PID_FILE: &str = "daemon.pid";
 
 pub fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
     let identity = Identity::load_or_create(&state_dir.join(KEY_FILE))?;
@@ -127,6 +128,78 @@ pub async fn join_group(
     GroupState::replace(peers_path, members)?;
     tracing::info!("joined group via {}", ticket.issuer);
     Ok(())
+}
+
+/// Fork into the background (double-fork), redirect stdin/stdout/stderr to
+/// /dev/null, and return in the surviving grandchild. The two parent processes
+/// exit immediately so the calling shell gets its prompt back.
+#[cfg(unix)]
+pub fn daemonize() -> io::Result<()> {
+    unsafe {
+        match libc::fork() {
+            -1 => return Err(io::Error::last_os_error()),
+            0 => {}
+            _ => std::process::exit(0),
+        }
+        if libc::setsid() == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        match libc::fork() {
+            -1 => return Err(io::Error::last_os_error()),
+            0 => {}
+            _ => std::process::exit(0),
+        }
+        let devnull = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_RDWR);
+        if devnull >= 0 {
+            libc::dup2(devnull, libc::STDIN_FILENO);
+            libc::dup2(devnull, libc::STDOUT_FILENO);
+            libc::dup2(devnull, libc::STDERR_FILENO);
+            libc::close(devnull);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn daemonize() -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "--daemon is not supported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+pub fn stop_cmd(state_dir: &Path) -> io::Result<()> {
+    let pid_path = state_dir.join(PID_FILE);
+    let contents = fs::read_to_string(&pid_path)
+        .map_err(|_| io::Error::other("daemon is not running (no PID file found)"))?;
+    let pid: libc::pid_t = contents
+        .trim()
+        .parse()
+        .map_err(|_| io::Error::other("invalid PID file"))?;
+
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            let _ = fs::remove_file(&pid_path);
+            return Err(io::Error::other(
+                "daemon is not running (stale PID file removed)",
+            ));
+        }
+        return Err(err);
+    }
+    let _ = fs::remove_file(&pid_path);
+    println!("stopped {pid}");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn stop_cmd(_state_dir: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "lil stop is not supported on this platform",
+    ))
 }
 
 #[cfg(unix)]
