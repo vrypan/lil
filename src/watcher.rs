@@ -1,4 +1,7 @@
-use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{
+    Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher as _,
+    event::{AccessKind, AccessMode, EventKind},
+};
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -46,7 +49,11 @@ fn spawn_watcher(
             match result {
                 Ok(event) => {
                     tracing::debug!("filesystem event: {:?}", event.kind);
-                    let mut paths = event.paths;
+                    let mut paths = if is_relevant_event(&event) {
+                        event.paths
+                    } else {
+                        Vec::new()
+                    };
                     drain_debounce_window(&watch_rx, debounce, &mut paths);
                     paths.retain(|path| !is_ignored_event_path(path));
                     paths.sort();
@@ -76,13 +83,30 @@ fn drain_debounce_window(
         match rx.recv_timeout(remaining) {
             Ok(Ok(event)) => {
                 tracing::debug!("filesystem event: {:?}", event.kind);
-                paths.extend(event.paths);
+                if is_relevant_event(&event) {
+                    paths.extend(event.paths);
+                }
             }
             Ok(Err(err)) => tracing::warn!("filesystem watch error: {err}"),
             Err(mpsc::RecvTimeoutError::Timeout) => return,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
     }
+}
+
+fn is_relevant_event(event: &Event) -> bool {
+    !matches!(
+        event.kind,
+        EventKind::Access(
+            AccessKind::Any
+                | AccessKind::Read
+                | AccessKind::Open(_)
+                | AccessKind::Close(AccessMode::Read)
+                | AccessKind::Close(AccessMode::Execute)
+                | AccessKind::Close(AccessMode::Other)
+                | AccessKind::Other
+        )
+    )
 }
 
 fn is_ignored_event_path(path: &std::path::Path) -> bool {
@@ -114,5 +138,18 @@ mod tests {
         )));
         assert!(is_ignored_event_path(Path::new(".lil/recv-file")));
         assert!(!is_ignored_event_path(Path::new("/tmp/root/file.txt")));
+    }
+
+    #[test]
+    fn ignores_read_access_events() {
+        let read = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)));
+        let write = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Write)));
+        let modify = Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )));
+
+        assert!(!is_relevant_event(&read));
+        assert!(is_relevant_event(&write));
+        assert!(is_relevant_event(&modify));
     }
 }

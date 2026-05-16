@@ -23,7 +23,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 const KEY_FILE: &str = "private.key";
@@ -392,6 +392,13 @@ async fn apply_filesystem_paths(
     local_origin: &str,
     paths: Vec<PathBuf>,
 ) {
+    let scan_start = Instant::now();
+    let path_count = paths.len();
+    let scan_cause = if paths.is_empty() {
+        "full-rescan"
+    } else {
+        "event-paths"
+    };
     let update = {
         let mut state = state.write().await;
         let before_state = state.root_hash();
@@ -415,6 +422,17 @@ async fn apply_filesystem_paths(
             }
         }
     };
+    let changes_count = update
+        .as_ref()
+        .map(|(changes, _, _)| changes.len())
+        .unwrap_or(0);
+    tracing::debug!(
+        "filesystem scan cause={} paths={} changes={} elapsed_ms={}",
+        scan_cause,
+        path_count,
+        changes_count,
+        scan_start.elapsed().as_millis()
+    );
     if let Some((changes, snapshot, hint)) = update {
         tracing::info!("filesystem changed paths={}", changes.len());
         publish_filesystem_changed(rpc_client, group, &snapshot, local_origin, hint).await;
