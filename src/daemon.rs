@@ -5,7 +5,10 @@ use crate::message::{GossipMessage, TreeHint};
 use crate::rpc::{self, RpcClient};
 use crate::state::{Change, FolderState, GcWatermark};
 use crate::sync;
-use crate::ui::{StateSnapshot, StatusState, print_changes, print_remote_message, print_start, status_view_loop, summarize_message};
+use crate::ui::{
+    StateSnapshot, StatusState, print_changes, print_remote_message, print_start, status_view_loop,
+    summarize_message,
+};
 use crate::watcher;
 use std::collections::BTreeSet;
 use std::fs;
@@ -591,11 +594,7 @@ fn path_prefixes(path: &str) -> Vec<String> {
     out
 }
 
-async fn publish(
-    rpc_client: &RpcClient,
-    group: Arc<RwLock<GroupState>>,
-    message: GossipMessage,
-) {
+async fn publish(rpc_client: &RpcClient, group: Arc<RwLock<GroupState>>, message: GossipMessage) {
     tracing::debug!("announce send {}", summarize_message(&message));
     let peers = group.read().await.active_peers();
     for peer in peers {
@@ -763,11 +762,7 @@ pub async fn maybe_gc_tombstones(
     publish_sync_state(rpc_client, group, &snapshot, local_origin).await;
 }
 
-fn maybe_probe_remote_rpc(
-    rpc_client: RpcClient,
-    message: GossipMessage,
-    shared: DaemonShared,
-) {
+fn maybe_probe_remote_rpc(rpc_client: RpcClient, message: GossipMessage, shared: DaemonShared) {
     let (origin, remote_state_root, remote_live_root, remote_lamport, hint, use_advertised_root) =
         match message {
             GossipMessage::SyncState {

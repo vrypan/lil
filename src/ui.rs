@@ -2,7 +2,7 @@ use crate::discovery::AddressBook;
 use crate::group::{GroupState, MemberStatus};
 use crate::identity::NodeId;
 use crate::message::GossipMessage;
-use crate::state::{FolderState, Change, hex};
+use crate::state::{Change, FolderState, hex};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;

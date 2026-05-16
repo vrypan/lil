@@ -82,11 +82,11 @@ async fn run(cli: Cli) -> io::Result<()> {
             fs::create_dir_all(&folder)?;
             let state_dir = folder.join(".lil");
             fs::create_dir_all(&state_dir)?;
-            let identity =
-                Arc::new(crate::identity::Identity::load_or_create(&state_dir.join(KEY_FILE))?);
+            let identity = Arc::new(crate::identity::Identity::load_or_create(
+                &state_dir.join(KEY_FILE),
+            )?);
             let address_book = discovery::new_address_book();
-            let _mdns =
-                discovery::spawn_browser(identity.node_id(), Arc::clone(&address_book))?;
+            let _mdns = discovery::spawn_browser(identity.node_id(), Arc::clone(&address_book))?;
             let peers_path = state_dir.join(PEERS_FILE);
             join_group(
                 Arc::clone(&identity),

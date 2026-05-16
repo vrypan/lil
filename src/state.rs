@@ -3,10 +3,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::entries::{placeholder_version, same_observed_state, tombstone_entry, validate_symlink_target};
+use crate::entries::{
+    placeholder_version, same_observed_state, tombstone_entry, validate_symlink_target,
+};
 use crate::ignore::{IGNORE_FILE_NAME, STATE_DIR, load_ignore_patterns, should_ignore};
-use crate::scan::{mode, normalize_event_path, observe_file_when_stable, relative_path, scan_dir, scan_folder};
-use crate::tree::{TreeSnapshot, derive_live_tree, derive_tree, normalize_prefix, update_tree_snapshot};
+use crate::scan::{
+    mode, normalize_event_path, observe_file_when_stable, relative_path, scan_dir, scan_folder,
+};
+use crate::tree::{
+    TreeSnapshot, derive_live_tree, derive_tree, normalize_prefix, update_tree_snapshot,
+};
 
 pub use crate::entries::{Change, Entry, EntryKind, GcWatermark, Version, hex};
 pub use crate::tree::{TreeNode, entry_hash, tree_node_hash};

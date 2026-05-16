@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
 use crate::entries::{Entry, EntryKind};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TreeNode {

@@ -1,10 +1,10 @@
+use crate::entries::{Entry, EntryKind, placeholder_version, validate_symlink_target};
+use crate::ignore::{IgnorePattern, load_ignore_patterns, should_ignore};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use crate::entries::{Entry, EntryKind, placeholder_version, validate_symlink_target};
-use crate::ignore::{IgnorePattern, load_ignore_patterns, should_ignore};
 
 const FILE_STABLE_AGE: Duration = Duration::from_secs(1);
 pub(crate) const FILE_STABILITY_PAUSE: Duration = Duration::from_millis(250);

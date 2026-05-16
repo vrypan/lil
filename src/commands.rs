@@ -3,7 +3,7 @@ use crate::discovery::AddressBook;
 use crate::group::{GroupState, add_invite, generate_secret, now_ms};
 use crate::identity::Identity;
 use crate::rpc::RpcClient;
-use crate::state::{hex, load_stored_entries, Entry, EntryKind};
+use crate::state::{Entry, EntryKind, hex, load_stored_entries};
 use std::fs;
 use std::io;
 use std::path::Path;
