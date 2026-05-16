@@ -10,17 +10,17 @@ mod transport;
 mod watcher;
 
 use crate::discovery::AddressBook;
-use crate::group::GroupState;
+use crate::group::{GroupState, MemberStatus};
 use crate::identity::{Identity, NodeId};
 use crate::message::{GossipMessage, TreeHint};
 use crate::state::{Change, Entry, EntryKind, FolderState, GcWatermark, hex};
 use clap::{Parser, Subcommand};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex as StdMutex,
     atomic::{AtomicBool, Ordering as AtomicOrdering},
 };
 use std::time::{Duration, Instant};
@@ -74,8 +74,31 @@ struct DaemonShared {
     downloads: sync::DownloadCoordinator,
     sync_activity: Arc<SyncActivity>,
     reconcile_gate: Arc<Mutex<()>>,
+    status: Arc<StatusState>,
     publisher: rpc::RpcClient,
     local_origin: String,
+}
+
+#[derive(Default)]
+struct StatusState {
+    current_sync: StdMutex<Option<NodeId>>,
+}
+
+impl StatusState {
+    fn begin_sync(&self, peer: NodeId) {
+        *self.current_sync.lock().expect("status state poisoned") = Some(peer);
+    }
+
+    fn end_sync(&self, peer: NodeId) {
+        let mut current = self.current_sync.lock().expect("status state poisoned");
+        if current.is_some_and(|active| active == peer) {
+            *current = None;
+        }
+    }
+
+    fn current_sync(&self) -> Option<NodeId> {
+        *self.current_sync.lock().expect("status state poisoned")
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -96,6 +119,9 @@ enum Command {
         /// How often to publish local root state
         #[arg(long, value_name = "SECONDS", default_value = "10")]
         announce_interval_secs: u64,
+        /// Show a quiet peer status view instead of regular info logs
+        #[arg(long)]
+        status: bool,
     },
     /// Create a one-time join ticket and exit
     Invite {
@@ -117,6 +143,9 @@ enum Command {
         /// Exit after joining instead of starting the sync daemon
         #[arg(long)]
         exit: bool,
+        /// Show a quiet peer status view after joining
+        #[arg(long)]
+        status: bool,
     },
     /// Remove a peer by node ID or name
     Remove {
@@ -148,24 +177,38 @@ struct JoinTicket {
 
 #[tokio::main]
 async fn main() {
+    let cli = Cli::parse();
+    let default_filter = if cli.status_mode() { "warn" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
         .with_level(true)
         .with_target(false)
         .init();
 
-    if let Err(err) = run().await {
+    if let Err(err) = run(cli).await {
         tracing::error!("{err}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> io::Result<()> {
-    let cli = Cli::parse();
+impl Cli {
+    fn status_mode(&self) -> bool {
+        matches!(
+            self.command,
+            Command::Sync { status: true, .. }
+                | Command::Join {
+                    status: true,
+                    exit: false,
+                    ..
+                }
+        )
+    }
+}
 
+async fn run(cli: Cli) -> io::Result<()> {
     match cli.command {
         Command::Invite {
             folder,
@@ -196,6 +239,7 @@ async fn run() -> io::Result<()> {
             ticket,
             name,
             exit,
+            status,
         } => {
             fs::create_dir_all(&folder)?;
             let state_dir = folder.join(".lil");
@@ -215,7 +259,7 @@ async fn run() -> io::Result<()> {
             if exit {
                 return Ok(());
             }
-            run_sync(folder, name, false, 500, 10).await?;
+            run_sync(folder, name, false, 500, 10, status).await?;
         }
         Command::Sync {
             folder,
@@ -223,7 +267,18 @@ async fn run() -> io::Result<()> {
             poll,
             interval_ms,
             announce_interval_secs,
-        } => run_sync(folder, name, poll, interval_ms, announce_interval_secs).await?,
+            status,
+        } => {
+            run_sync(
+                folder,
+                name,
+                poll,
+                interval_ms,
+                announce_interval_secs,
+                status,
+            )
+            .await?
+        }
     }
     Ok(())
 }
@@ -234,6 +289,7 @@ async fn run_sync(
     poll: bool,
     interval_ms: u64,
     announce_interval_secs: u64,
+    status: bool,
 ) -> io::Result<()> {
     fs::create_dir_all(&folder)?;
 
@@ -259,6 +315,7 @@ async fn run_sync(
     let downloads = sync::DownloadCoordinator::default();
     let sync_activity = Arc::new(SyncActivity::default());
     let reconcile_gate = Arc::new(Mutex::new(()));
+    let status_state = Arc::new(StatusState::default());
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
     let (rpc_event_tx, mut rpc_event_rx) = mpsc::unbounded_channel();
@@ -283,6 +340,7 @@ async fn run_sync(
         downloads: downloads.clone(),
         sync_activity: Arc::clone(&sync_activity),
         reconcile_gate: Arc::clone(&reconcile_gate),
+        status: Arc::clone(&status_state),
         publisher: rpc_client.clone(),
         local_origin: local_origin.clone(),
     };
@@ -303,6 +361,16 @@ async fn run_sync(
         .await;
     }
     publish_peers(&rpc_client, Arc::clone(&group), &local_origin).await;
+    if status {
+        tokio::spawn(status_view_loop(
+            Arc::clone(&state),
+            Arc::clone(&group),
+            Arc::clone(&root_reports),
+            Arc::clone(&address_book),
+            Arc::clone(&status_state),
+            local_origin.clone(),
+        ));
+    }
     maybe_gc_tombstones(
         Arc::clone(&state),
         Arc::clone(&group),
@@ -465,6 +533,7 @@ impl StateSnapshot {
 #[derive(Clone, Copy)]
 struct RootReport {
     state_root: [u8; 32],
+    live_root: [u8; 32],
     lamport: u64,
 }
 
@@ -491,6 +560,106 @@ impl RootReports {
                 .is_some_and(|report| report.state_root == local_root)
         })
     }
+
+    fn is_synced(&self, peer: &str, local: &StateSnapshot) -> bool {
+        self.reports.get(peer).is_some_and(|report| {
+            report.state_root == local.state_root && report.live_root == local.live_root
+        })
+    }
+}
+
+async fn status_view_loop(
+    state: Arc<RwLock<FolderState>>,
+    group: Arc<RwLock<GroupState>>,
+    root_reports: Arc<RwLock<RootReports>>,
+    address_book: AddressBook,
+    status: Arc<StatusState>,
+    local_origin: String,
+) {
+    let frames = ["-", "\\", "|", "/"];
+    let mut tick = 0usize;
+    loop {
+        render_status_view(
+            &state,
+            &group,
+            &root_reports,
+            &address_book,
+            &status,
+            &local_origin,
+            frames[tick % frames.len()],
+        )
+        .await;
+        tick = tick.wrapping_add(1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn render_status_view(
+    state: &Arc<RwLock<FolderState>>,
+    group: &Arc<RwLock<GroupState>>,
+    root_reports: &Arc<RwLock<RootReports>>,
+    address_book: &AddressBook,
+    status: &StatusState,
+    local_origin: &str,
+    spinner: &str,
+) {
+    let local = {
+        let state = state.read().await;
+        StateSnapshot::from_state(&state)
+    };
+    let members = group.read().await.members();
+    let reports = root_reports.read().await;
+    let addresses = address_book.read().await;
+    let syncing_peer = status.current_sync();
+
+    print!("\x1b[2J\x1b[H");
+    println!("lilsync {}", short_id(local_origin));
+    println!(
+        "root {}  entries {}",
+        hex(local.state_root),
+        local.state_nodes
+    );
+    println!();
+
+    let mut shown = 0usize;
+    for member in members
+        .iter()
+        .filter(|member| member.id != local_origin)
+        .filter(|member| member.status == MemberStatus::Active)
+    {
+        shown += 1;
+        let peer = member.id.parse::<NodeId>().ok();
+        let online = peer.is_some_and(|peer| addresses.contains_key(&peer));
+        let is_syncing = peer.is_some_and(|peer| syncing_peer == Some(peer));
+        let synced = reports.is_synced(&member.id, &local);
+        let label = member.name.as_deref().unwrap_or(&member.id);
+        let status_text = if !online {
+            "offline".to_string()
+        } else if is_syncing || !synced {
+            format!("syncing {spinner}")
+        } else {
+            "synced".to_string()
+        };
+        println!("{:<14} {}", status_text, truncate_label(label));
+    }
+    if shown == 0 {
+        println!("no peers");
+    }
+    let _ = io::stdout().flush();
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
+}
+
+fn truncate_label(label: &str) -> String {
+    const MAX_LABEL: usize = 32;
+    let mut chars = label.chars();
+    let mut out: String = chars.by_ref().take(MAX_LABEL).collect();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 async fn publish_sync_state(
@@ -729,18 +898,21 @@ fn root_report_from_message(message: &GossipMessage) -> Option<(String, RootRepo
         GossipMessage::SyncState {
             origin,
             state_root,
+            live_root,
             lamport,
             ..
         }
         | GossipMessage::FilesystemChanged {
             origin,
             state_root,
+            live_root,
             lamport,
             ..
         } => Some((
             origin.clone(),
             RootReport {
                 state_root: *state_root,
+                live_root: *live_root,
                 lamport: *lamport,
             },
         )),
@@ -876,6 +1048,7 @@ fn maybe_probe_remote_rpc(
                 Ok(None)
             } else if use_advertised_root {
                 shared.sync_activity.begin();
+                shared.status.begin_sync(peer);
                 match sync::reconcile_with_advertised_root(
                     rpc_client,
                     Arc::clone(&shared.state),
@@ -895,6 +1068,7 @@ fn maybe_probe_remote_rpc(
                 }
             } else {
                 shared.sync_activity.begin();
+                shared.status.begin_sync(peer);
                 match sync::reconcile_with_peer(
                     rpc_client,
                     Arc::clone(&shared.state),
@@ -944,6 +1118,7 @@ fn maybe_probe_remote_rpc(
             .await;
         }
         shared.sync_activity.end();
+        shared.status.end_sync(peer);
 
         if shared.sync_activity.take_pending_rescan() {
             tracing::debug!("running filesystem rescan queued at remote sync boundary");
