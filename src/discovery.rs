@@ -68,7 +68,7 @@ pub fn spawn(
     address_book: AddressBook,
 ) -> io::Result<MdnsHandle> {
     let mdns = ServiceDaemon::new().map_err(io::Error::other)?;
-    let instance = format!("lilsync-{}", &local_id.to_string()[..12]);
+    let instance = format!("lil-{}", node_id_b32_prefix(&local_id));
     let host = format!("{instance}.local.");
     let mut props = HashMap::new();
     props.insert("id".to_string(), local_id.to_string());
@@ -143,6 +143,14 @@ fn spawn_browser_task(
     });
 
     Ok(())
+}
+
+fn node_id_b32_prefix(id: &NodeId) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let n = u32::from_be_bytes(id.as_bytes()[..4].try_into().unwrap());
+    (0..6)
+        .map(|i| ALPHABET[((n >> (27 - i * 5)) & 0x1F) as usize] as char)
+        .collect()
 }
 
 fn best_addr(addresses: &HashSet<ScopedIp>, port: u16) -> Option<SocketAddr> {
