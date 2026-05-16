@@ -1,3 +1,7 @@
+//! `.nolil` ignore-pattern parsing and matching. Supports gitignore-style
+//! glob patterns (anchoring, negation, directory-only, `**`). Also defines
+//! the built-in exclusions for OS metadata files and the `.lil` state dir.
+
 use std::fs;
 use std::io;
 use std::path::Path;

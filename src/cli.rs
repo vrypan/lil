@@ -1,3 +1,6 @@
+//! CLI argument types (`Cli`, `Command`) and base62 ticket encoding/decoding
+//! used by the invite/join flow.
+
 use crate::identity::NodeId;
 use crate::state::hex;
 use clap::{Parser, Subcommand};

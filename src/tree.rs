@@ -1,3 +1,7 @@
+//! Merkle tree over the entry index. Provides `TreeNode`/`TreeSnapshot` types,
+//! full derivation from scratch, and incremental update after a set of path
+//! changes. Hashing uses BLAKE3 with a deterministic encoding of entry fields.
+
 use crate::entries::{Entry, EntryKind};
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,3 +1,7 @@
+//! Noise NN handshake with an Ed25519 authentication payload exchanged after
+//! the handshake. Provides `NoiseConnection` for length-prefixed encrypted
+//! frame I/O over any async byte stream.
+
 use crate::identity::{Identity, NodeId};
 use serde::{Deserialize, Serialize};
 use snow::TransportState;

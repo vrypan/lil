@@ -1,3 +1,6 @@
+//! Group membership ledger: tracks active/removed members, generates and
+//! validates one-time invite tokens, and merges peer lists received over RPC.
+
 use crate::identity::NodeId;
 use crate::state::hex;
 use serde::{Deserialize, Serialize};

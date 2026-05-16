@@ -1,3 +1,7 @@
+//! Sync reconciliation: walks the remote Merkle tree to find differing nodes,
+//! then fetches and applies missing entries. Coordinates concurrent file
+//! downloads with `DownloadCoordinator` to avoid duplicate transfers.
+
 use crate::identity::NodeId;
 use crate::message::TreeHint;
 use crate::rpc::RpcClient;

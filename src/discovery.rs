@@ -1,3 +1,6 @@
+//! mDNS-based peer discovery: advertises this node's RPC port on the local
+//! network and maintains an address book mapping `NodeId` to `SocketAddr`.
+
 use crate::identity::NodeId;
 use mdns_sd::{ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo, UnregisterStatus};
 use std::collections::{HashMap, HashSet};

@@ -1,3 +1,7 @@
+//! RPC message enums: `RequestMessage` and `ResponseMessage`. Defines the
+//! wire protocol between RPC client and server (join, tree queries, file
+//! transfer, peer list, gossip announce).
+
 use crate::group::MemberEntry;
 use crate::message::GossipMessage;
 use crate::state::{Entry, TreeNode};

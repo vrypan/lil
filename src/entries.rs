@@ -1,3 +1,7 @@
+//! Core data types: `Entry`, `EntryKind`, `Version`, `Change`, `GcWatermark`.
+//! Also contains helpers for constructing tombstones and validating remote
+//! paths and symlink targets.
+
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io;

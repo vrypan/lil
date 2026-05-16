@@ -1,3 +1,7 @@
+//! Gossip message types broadcast between peers: `SyncState` (full root
+//! snapshot), `FilesystemChanged` (incremental with optional tree hint),
+//! and `Peers` (member list).
+
 use crate::group::MemberEntry;
 use crate::state::{GcWatermark, TreeNode};
 

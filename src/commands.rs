@@ -1,3 +1,6 @@
+//! One-shot CLI subcommand implementations: `invite`, `peers`, `remove`,
+//! `join`, `dump-state`, and the per-folder daemon lock.
+
 use crate::cli::{encode_ticket, parse_join_ticket};
 use crate::discovery::AddressBook;
 use crate::group::{GroupState, add_invite, generate_secret, now_ms};

@@ -1,3 +1,6 @@
+//! Ed25519 node identity: key generation, loading from and saving to disk,
+//! the `NodeId` (verifying key) type, and signature helpers.
+
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::fmt;
 use std::fs;

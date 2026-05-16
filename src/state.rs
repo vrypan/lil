@@ -1,3 +1,8 @@
+//! `FolderState`: the authoritative on-disk and in-memory sync state for one
+//! watched folder — entry index, Merkle trees, Lamport clock, and GC
+//! watermark. Also re-exports all public entry and tree types so that callers
+//! only need to import from this module.
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};

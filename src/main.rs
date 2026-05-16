@@ -1,3 +1,6 @@
+//! Entry point. Parses CLI arguments, initialises logging, and dispatches to
+//! subcommand handlers or the sync daemon.
+
 mod cli;
 mod commands;
 mod daemon;

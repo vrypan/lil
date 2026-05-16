@@ -1,3 +1,7 @@
+//! Filesystem scanning: recursive directory traversal, file stability
+//! detection (hash-after-stable-mtime), symlink reading, and event-path
+//! canonicalisation for incremental updates.
+
 use crate::entries::{Entry, EntryKind, placeholder_version, validate_symlink_target};
 use crate::ignore::{IgnorePattern, load_ignore_patterns, should_ignore};
 use std::collections::{BTreeMap, BTreeSet};

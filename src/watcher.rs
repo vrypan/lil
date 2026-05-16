@@ -1,3 +1,6 @@
+//! Filesystem event monitoring. Wraps the `notify` crate with debouncing,
+//! a polling fallback, and filtering of access-only and state-dir events.
+
 use notify::{
     Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher as _,
     event::{AccessKind, AccessMode, EventKind},

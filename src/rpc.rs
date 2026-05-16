@@ -1,3 +1,7 @@
+//! RPC client and server over Noise-encrypted TCP. The server dispatches
+//! requests (root, node, entry, object, peers, join, announce); the client
+//! drives sync and gossip on behalf of the daemon.
+
 use crate::discovery::AddressBook;
 use crate::group::{self, GroupState, MemberEntry};
 use crate::identity::{Identity, NodeId};

@@ -1,3 +1,6 @@
+//! Terminal output: the live status view, change/peer/state log helpers, and
+//! the `StateSnapshot` and `StatusState` types shared with the daemon.
+
 use crate::discovery::AddressBook;
 use crate::group::{GroupState, MemberStatus};
 use crate::identity::NodeId;

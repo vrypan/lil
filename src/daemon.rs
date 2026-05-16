@@ -1,3 +1,6 @@
+//! The sync daemon: main event loop, filesystem-change handling, peer
+//! announcement fanout, remote reconciliation dispatch, and GC triggering.
+
 use crate::commands::{INVITES_FILE, KEY_FILE, PEERS_FILE, acquire_daemon_lock};
 use crate::group::{GroupState, MemberEntry, MemberStatus};
 use crate::identity::{Identity, NodeId};
