@@ -71,7 +71,7 @@ pub async fn status_view_loop(
     status: Arc<StatusState>,
     local_origin: String,
 ) {
-    let frames = ["-", "\\", "|", "/"];
+    let frames = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
     let mut tick = 0usize;
     loop {
         render_status_view(
@@ -132,13 +132,13 @@ pub async fn render_status_view(
             .and_then(|info| info.name.as_deref())
             .unwrap_or(&member.id);
         let status_text = if !online {
-            "offline".to_string()
+            "\x1b[31moffline\x1b[0m  ".to_string()
         } else if is_syncing || !synced {
-            format!("syncing {spinner}")
+            format!("\x1b[33msyncing\x1b[0m {spinner}")
         } else {
-            "synced".to_string()
+            "\x1b[32msynced\x1b[0m   ".to_string()
         };
-        println!("{:<14} {}", status_text, truncate_label(label));
+        println!("{} {}", status_text, truncate_label(label));
     }
     if shown == 0 {
         println!("no peers");
