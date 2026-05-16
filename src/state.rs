@@ -729,11 +729,42 @@ fn load_gc_watermark(state_dir: &Path) -> GcWatermark {
 
 fn remove_path_if_exists(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(metadata) if metadata.is_dir() => remove_dir_all_writable(path),
         Ok(_) => fs::remove_file(path),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
     }
+}
+
+#[cfg(unix)]
+fn remove_dir_all_writable(path: &Path) -> io::Result<()> {
+    make_dir_tree_writable(path)?;
+    fs::remove_dir_all(path)
+}
+
+#[cfg(not(unix))]
+fn remove_dir_all_writable(path: &Path) -> io::Result<()> {
+    fs::remove_dir_all(path)
+}
+
+#[cfg(unix)]
+fn make_dir_tree_writable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    set_mode(path, Some(metadata.permissions().mode() | 0o700))?;
+    for child in fs::read_dir(path)? {
+        let child = child?;
+        let child_path = child.path();
+        let child_metadata = fs::symlink_metadata(&child_path)?;
+        if child_metadata.is_dir() {
+            make_dir_tree_writable(&child_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn install_remote_dir(path: &Path) -> io::Result<()> {
@@ -1741,6 +1772,50 @@ mod tests {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
         assert!(state.rescan().unwrap().is_empty());
         assert_eq!(state.entry("remote-dir").unwrap().version.lamport, 10);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn applies_remote_tombstone_to_read_only_directory_tree() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("remote-dir");
+        let child = dir.join("child");
+        fs::create_dir_all(&child).unwrap();
+        fs::write(child.join("file.txt"), "content").unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let remote = Entry {
+            path: "remote-dir".to_string(),
+            kind: EntryKind::Tombstone,
+            content_hash: None,
+            symlink_target: None,
+            size: 0,
+            mode: None,
+            version: Version {
+                lamport: 10,
+                origin: "node-b".to_string(),
+            },
+        };
+
+        let change = state.apply_remote_entry(remote, None).unwrap().unwrap();
+
+        assert_eq!(change.verb(), "delete");
+        assert!(!dir.exists());
+        assert_eq!(
+            state.entry("remote-dir").unwrap().kind,
+            EntryKind::Tombstone
+        );
+        assert_eq!(
+            state.entry("remote-dir/child").unwrap().kind,
+            EntryKind::Tombstone
+        );
+        assert_eq!(
+            state.entry("remote-dir/child/file.txt").unwrap().kind,
+            EntryKind::Tombstone
+        );
     }
 
     #[cfg(unix)]
