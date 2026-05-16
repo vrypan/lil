@@ -187,7 +187,11 @@ impl RpcClient {
             request_id,
             content_hash,
         };
-        let mut conn = self.connect(peer).await?;
+        let mut conn = if let Some(pooled) = self.pool.checkout(peer) {
+            pooled
+        } else {
+            self.connect(peer).await?
+        };
         conn.send_json(&request).await?;
 
         let header: ResponseMessage = rpc_timeout(
