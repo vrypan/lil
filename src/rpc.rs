@@ -75,6 +75,26 @@ impl RpcClient {
         }
     }
 
+    pub async fn get_peers(&self, peer: NodeId) -> io::Result<Vec<MemberEntry>> {
+        let request_id = next_request_id();
+        match self
+            .round_trip(peer, RequestMessage::GetPeers { request_id })
+            .await?
+        {
+            ResponseMessage::Peers {
+                request_id: actual,
+                members,
+            } if actual == request_id => Ok(members),
+            ResponseMessage::Error {
+                request_id: actual,
+                message,
+            } if actual == request_id => Err(io::Error::other(message)),
+            response => Err(io::Error::other(format!(
+                "unexpected GetPeers response from {peer}: {response:?}"
+            ))),
+        }
+    }
+
     pub async fn get_node(&self, peer: NodeId, prefix: &str) -> io::Result<Option<TreeNode>> {
         let request_id = next_request_id();
         let request = RequestMessage::GetNode {
@@ -414,6 +434,21 @@ async fn check_member(
     }
 }
 
+async fn check_known_member(
+    group: &Arc<RwLock<GroupState>>,
+    peer: NodeId,
+    request_id: u64,
+) -> Result<(), ResponseMessage> {
+    if group.read().await.is_known_member(&peer) {
+        Ok(())
+    } else {
+        Err(ResponseMessage::Error {
+            request_id,
+            message: "peer is not a group member".to_string(),
+        })
+    }
+}
+
 async fn handle_request(
     request: RequestMessage,
     peer: NodeId,
@@ -472,6 +507,15 @@ async fn handle_request(
                 state_root: state.root_hash(),
                 live_root: state.live_root_hash(),
                 lamport: state.lamport(),
+            }
+        }
+        RequestMessage::GetPeers { request_id } => {
+            if let Err(e) = check_known_member(group, peer, request_id).await {
+                return e;
+            }
+            ResponseMessage::Peers {
+                request_id,
+                members: group.read().await.members(),
             }
         }
         RequestMessage::GetNode { request_id, prefix } => {

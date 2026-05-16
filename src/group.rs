@@ -123,6 +123,10 @@ impl GroupState {
             .is_some_and(|entry| entry.status == MemberStatus::Active)
     }
 
+    pub fn is_known_member(&self, peer: &NodeId) -> bool {
+        self.members.contains_key(&peer.to_string())
+    }
+
     pub fn add_active_peer(&mut self, peer: NodeId, name: Option<String>) -> io::Result<bool> {
         let id = peer.to_string();
         let lamport = next_lamport(&self.members);

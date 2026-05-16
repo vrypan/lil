@@ -15,6 +15,9 @@ pub enum RequestMessage {
     GetRoot {
         request_id: u64,
     },
+    GetPeers {
+        request_id: u64,
+    },
     GetNode {
         request_id: u64,
         prefix: String,
@@ -51,6 +54,10 @@ pub enum ResponseMessage {
         state_root: [u8; 32],
         live_root: [u8; 32],
         lamport: u64,
+    },
+    Peers {
+        request_id: u64,
+        members: Vec<MemberEntry>,
     },
     Node {
         request_id: u64,

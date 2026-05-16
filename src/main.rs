@@ -30,6 +30,8 @@ const KEY_FILE: &str = "private.key";
 const PEERS_FILE: &str = "peers.json";
 const INVITES_FILE: &str = "invites.json";
 const MAX_FILESYSTEM_CHANGED_BYTES: usize = 3_000;
+const SYNC_STATE_HEARTBEAT_SECS: u64 = 60;
+const PEERS_HEARTBEAT_SECS: u64 = 300;
 
 #[derive(Parser, Debug)]
 #[command(name = "lil", about = "lilsync folder sync daemon")]
@@ -361,6 +363,22 @@ async fn run_sync(
         .await;
     }
     publish_peers(&rpc_client, Arc::clone(&group), &local_origin).await;
+    request_peer_lists(
+        rpc_client.clone(),
+        Arc::clone(&group),
+        bootstrap.clone(),
+        rpc_client.clone(),
+        local_origin.clone(),
+    );
+    let mut publish_tracker = PublishTracker::default();
+    {
+        let state = state.read().await;
+        publish_tracker.mark_sync(&StateSnapshot::from_state(&state));
+    }
+    {
+        let group = group.read().await;
+        publish_tracker.mark_peers(&group.members());
+    }
     if status {
         tokio::spawn(status_view_loop(
             Arc::clone(&state),
@@ -428,8 +446,18 @@ async fn run_sync(
                     let state = state.read().await;
                     StateSnapshot::from_state(&state)
                 };
-                publish_sync_state(&rpc_client, Arc::clone(&group), &snapshot, &local_origin).await;
-                publish_peers(&rpc_client, Arc::clone(&group), &local_origin).await;
+                if publish_tracker.should_publish_sync(&snapshot) {
+                    publish_sync_state(&rpc_client, Arc::clone(&group), &snapshot, &local_origin).await;
+                    publish_tracker.mark_sync(&snapshot);
+                }
+                let members = {
+                    let group = group.read().await;
+                    group.members()
+                };
+                if publish_tracker.should_publish_peers(&members) {
+                    publish_peers(&rpc_client, Arc::clone(&group), &local_origin).await;
+                    publish_tracker.mark_peers(&members);
+                }
             }
         }
     }
@@ -528,6 +556,81 @@ impl StateSnapshot {
             gc_watermark: state.gc_watermark().clone(),
         }
     }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct SyncPublishMarker {
+    state_root: [u8; 32],
+    live_root: [u8; 32],
+    lamport: u64,
+    gc_watermark: GcWatermark,
+}
+
+impl SyncPublishMarker {
+    fn from_snapshot(snapshot: &StateSnapshot) -> Self {
+        Self {
+            state_root: snapshot.state_root,
+            live_root: snapshot.live_root,
+            lamport: snapshot.lamport,
+            gc_watermark: snapshot.gc_watermark.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PublishTracker {
+    last_sync: Option<SyncPublishMarker>,
+    last_sync_at: Option<Instant>,
+    last_peers: Option<Vec<PeerPublishMarker>>,
+    last_peers_at: Option<Instant>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct PeerPublishMarker {
+    id: String,
+    status: MemberStatus,
+    lamport: u64,
+    name: Option<String>,
+}
+
+impl PublishTracker {
+    fn should_publish_sync(&self, snapshot: &StateSnapshot) -> bool {
+        let marker = SyncPublishMarker::from_snapshot(snapshot);
+        self.last_sync.as_ref() != Some(&marker)
+            || self
+                .last_sync_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(SYNC_STATE_HEARTBEAT_SECS))
+    }
+
+    fn mark_sync(&mut self, snapshot: &StateSnapshot) {
+        self.last_sync = Some(SyncPublishMarker::from_snapshot(snapshot));
+        self.last_sync_at = Some(Instant::now());
+    }
+
+    fn should_publish_peers(&self, members: &[crate::group::MemberEntry]) -> bool {
+        let marker = peer_publish_marker(members);
+        self.last_peers.as_ref() != Some(&marker)
+            || self
+                .last_peers_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(PEERS_HEARTBEAT_SECS))
+    }
+
+    fn mark_peers(&mut self, members: &[crate::group::MemberEntry]) {
+        self.last_peers = Some(peer_publish_marker(members));
+        self.last_peers_at = Some(Instant::now());
+    }
+}
+
+fn peer_publish_marker(members: &[crate::group::MemberEntry]) -> Vec<PeerPublishMarker> {
+    members
+        .iter()
+        .map(|member| PeerPublishMarker {
+            id: member.id.clone(),
+            status: member.status.clone(),
+            lamport: member.lamport,
+            name: member.name.clone(),
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -704,6 +807,49 @@ async fn publish_peers(rpc_client: &rpc::RpcClient, group: Arc<RwLock<GroupState
         members,
     };
     publish(rpc_client, group, message).await;
+}
+
+fn request_peer_lists(
+    rpc_client: rpc::RpcClient,
+    group: Arc<RwLock<GroupState>>,
+    peers: Vec<NodeId>,
+    publisher: rpc::RpcClient,
+    local_origin: String,
+) {
+    for peer in peers {
+        let rpc_client = rpc_client.clone();
+        let group = Arc::clone(&group);
+        let publisher = publisher.clone();
+        let local_origin = local_origin.clone();
+        tokio::spawn(async move {
+            match rpc_client.get_peers(peer).await {
+                Ok(members) => {
+                    let update = match group.write().await.merge_members(members) {
+                        Ok(update) => update,
+                        Err(err) => {
+                            tracing::warn!("get-peers peer={} merge failed: {err}", peer);
+                            return;
+                        }
+                    };
+                    if update.changed {
+                        tracing::info!(
+                            "get-peers peer={} updated active={}",
+                            peer,
+                            update.active_peers.len()
+                        );
+                        if update.removed_self {
+                            tracing::warn!("this node is marked removed from the group");
+                        } else {
+                            publish_peers(&publisher, Arc::clone(&group), &local_origin).await;
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!("get-peers peer={} failed: {err}", peer);
+                }
+            }
+        });
+    }
 }
 
 fn build_tree_hint(
