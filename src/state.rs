@@ -1,130 +1,17 @@
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{Duration, SystemTime};
 
-const STATE_DIR: &str = ".lil";
-const IGNORE_FILE_NAME: &str = ".nolil";
-const IGNORED_FILE_NAMES: &[&str] = &[".DS_Store", "Thumbs.db", "Desktop.ini"];
-const IGNORED_FILE_PREFIXES: &[&str] = &["._"];
-const IGNORED_DIR_NAMES: &[&str] = &[
-    ".Spotlight-V100",
-    ".Trashes",
-    ".fseventsd",
-    "$RECYCLE.BIN",
-    "lost+found",
-];
-const FILE_STABLE_AGE: Duration = Duration::from_secs(1);
-const FILE_STABILITY_PAUSE: Duration = Duration::from_millis(250);
-const FILE_STABILITY_ATTEMPTS: usize = 8;
+use crate::entries::{placeholder_version, same_observed_state, tombstone_entry, validate_symlink_target};
+use crate::ignore::{IGNORE_FILE_NAME, STATE_DIR, load_ignore_patterns, should_ignore};
+use crate::scan::{mode, normalize_event_path, observe_file_when_stable, relative_path, scan_dir, scan_folder};
+use crate::tree::{TreeSnapshot, derive_live_tree, derive_tree, normalize_prefix, update_tree_snapshot};
+
+pub use crate::entries::{Change, Entry, EntryKind, GcWatermark, Version, hex};
+pub use crate::tree::{TreeNode, entry_hash, tree_node_hash};
+
 static NEXT_RECV_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EntryKind {
-    File,
-    Dir,
-    Tombstone,
-    Symlink,
-}
-
-impl EntryKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::Dir => "dir",
-            Self::Tombstone => "tombstone",
-            Self::Symlink => "symlink",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Version {
-    pub lamport: u64,
-    pub origin: String,
-}
-
-impl Ord for Version {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.lamport
-            .cmp(&other.lamport)
-            .then_with(|| self.origin.cmp(&other.origin))
-    }
-}
-
-impl PartialOrd for Version {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct Entry {
-    pub path: String,
-    pub kind: EntryKind,
-    pub content_hash: Option<[u8; 32]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symlink_target: Option<String>,
-    pub size: u64,
-    pub mode: Option<u32>,
-    pub version: Version,
-}
-
-#[derive(Debug, Clone)]
-pub struct Change {
-    pub path: String,
-    pub old: Option<Entry>,
-    pub new: Entry,
-}
-
-impl Change {
-    pub fn verb(&self) -> &'static str {
-        match (&self.old, self.new.kind) {
-            (None, EntryKind::File) => "file new",
-            (None, EntryKind::Dir) => "dir new",
-            (None, EntryKind::Tombstone) => "tombstone new",
-            (Some(_), EntryKind::Tombstone) => "delete",
-            (Some(old), EntryKind::File) if old.kind == EntryKind::File => "file update",
-            (Some(old), EntryKind::Dir) if old.kind == EntryKind::Dir => "dir update",
-            (Some(old), EntryKind::Symlink) if old.kind == EntryKind::Symlink => "symlink update",
-            (Some(_), EntryKind::File) => "file replace",
-            (Some(_), EntryKind::Dir) => "dir replace",
-            (None, EntryKind::Symlink) => "symlink new",
-            (Some(_), EntryKind::Symlink) => "symlink replace",
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TreeNode {
-    pub prefix: String,
-    pub entries: BTreeMap<String, [u8; 32]>,
-    pub children: BTreeMap<String, [u8; 32]>,
-    pub hash: [u8; 32],
-}
-
-#[derive(Debug, Clone)]
-pub struct TreeSnapshot {
-    pub root_hash: [u8; 32],
-    pub nodes: BTreeMap<String, TreeNode>,
-}
-
-pub type GcWatermark = BTreeMap<String, u64>;
-
-struct ScanResult {
-    entries: BTreeMap<String, Entry>,
-    unstable: BTreeSet<String>,
-}
-
-struct ObservedFile {
-    content_hash: [u8; 32],
-    size: u64,
-    mode: Option<u32>,
-}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct LegacyEntry {
@@ -149,6 +36,8 @@ impl LegacyEntry {
         }
     }
 }
+
+use std::collections::BTreeMap;
 
 #[derive(Debug)]
 pub struct FolderState {
@@ -329,9 +218,9 @@ impl FolderState {
         fs::rename(tmp_path, &dest)?;
 
         #[cfg(unix)]
-        if let Some(mode) = remote.mode {
+        if let Some(m) = remote.mode {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&dest, fs::Permissions::from_mode(mode))?;
+            fs::set_permissions(&dest, fs::Permissions::from_mode(m))?;
         }
 
         Ok(())
@@ -440,7 +329,7 @@ impl FolderState {
         &mut self,
         abs_path: &Path,
         relative: &str,
-        ignore_patterns: &[IgnorePattern],
+        ignore_patterns: &[crate::ignore::IgnorePattern],
         changes: &mut Vec<Change>,
     ) -> io::Result<()> {
         if should_ignore(relative, ignore_patterns) {
@@ -449,7 +338,7 @@ impl FolderState {
 
         match fs::symlink_metadata(abs_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                if let Some(target) = read_supported_symlink(abs_path)? {
+                if let Some(target) = crate::scan::read_supported_symlink(abs_path)? {
                     let live = Entry {
                         path: relative.to_string(),
                         kind: EntryKind::Symlink,
@@ -490,7 +379,7 @@ impl FolderState {
                 };
                 self.update_entry(relative, live, changes);
                 let mut dir_entries = BTreeMap::new();
-                let mut unstable = BTreeSet::new();
+                let mut unstable = std::collections::BTreeSet::new();
                 scan_dir(
                     &self.root,
                     abs_path,
@@ -807,6 +696,8 @@ fn create_symlink(_target: &str, _dest: &Path) -> io::Result<()> {
 }
 
 fn validate_remote_path(path: &str) -> io::Result<()> {
+    use crate::ignore::should_ignore_component;
+
     if path.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -852,733 +743,6 @@ fn validate_remote_path(path: &str) -> io::Result<()> {
     }
 
     Ok(())
-}
-
-fn validate_symlink_target(target: &str) -> io::Result<()> {
-    if target.is_empty() || target.contains('\0') || target.contains('\\') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid symlink target {target:?}"),
-        ));
-    }
-    let path = Path::new(target);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::Prefix(_)
-                    | std::path::Component::RootDir
-                    | std::path::Component::CurDir
-                    | std::path::Component::ParentDir
-            )
-        })
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid symlink target {target:?}"),
-        ));
-    }
-    Ok(())
-}
-
-fn normalize_event_path(path: &Path) -> Option<PathBuf> {
-    if path.parent().is_none() {
-        return fs::canonicalize(path).ok();
-    }
-    path.parent()
-        .and_then(|parent| fs::canonicalize(parent).ok())
-        .map(|parent| parent.join(path.file_name().unwrap_or_default()))
-}
-
-impl TreeSnapshot {
-    fn empty() -> Self {
-        let mut nodes = BTreeMap::new();
-        let root = hash_node("/", &BTreeMap::new(), &BTreeMap::new());
-        nodes.insert(
-            String::new(),
-            TreeNode {
-                prefix: "/".to_string(),
-                entries: BTreeMap::new(),
-                children: BTreeMap::new(),
-                hash: root,
-            },
-        );
-        Self {
-            root_hash: root,
-            nodes,
-        }
-    }
-}
-
-fn scan_folder(root: &Path) -> io::Result<ScanResult> {
-    let mut entries = BTreeMap::new();
-    let mut unstable = BTreeSet::new();
-    let ignore_patterns = load_ignore_patterns(root)?;
-    scan_dir(root, root, &ignore_patterns, &mut entries, &mut unstable)?;
-    Ok(ScanResult { entries, unstable })
-}
-
-fn scan_dir(
-    root: &Path,
-    dir: &Path,
-    ignore_patterns: &[IgnorePattern],
-    entries: &mut BTreeMap<String, Entry>,
-    unstable: &mut BTreeSet<String>,
-) -> io::Result<()> {
-    let mut children = Vec::new();
-    for child in fs::read_dir(dir)? {
-        let child = child?;
-        children.push(child.path());
-    }
-    children.sort();
-
-    for path in children {
-        let relative = relative_path(root, &path)?;
-        if should_ignore(&relative, ignore_patterns) {
-            continue;
-        }
-
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            if let Some(target) = read_supported_symlink(&path)? {
-                entries.insert(
-                    relative.clone(),
-                    Entry {
-                        path: relative,
-                        kind: EntryKind::Symlink,
-                        content_hash: None,
-                        symlink_target: Some(target),
-                        size: 0,
-                        mode: None,
-                        version: placeholder_version(),
-                    },
-                );
-            }
-            continue;
-        }
-
-        let mode = mode(&metadata);
-        if metadata.is_dir() {
-            entries.insert(
-                relative.clone(),
-                Entry {
-                    path: relative,
-                    kind: EntryKind::Dir,
-                    content_hash: None,
-                    symlink_target: None,
-                    size: 0,
-                    mode,
-                    version: placeholder_version(),
-                },
-            );
-            scan_dir(root, &path, ignore_patterns, entries, unstable)?;
-        } else if metadata.is_file() {
-            let Some(observed) = observe_file_when_stable(&path, metadata, false)? else {
-                tracing::debug!("file still changing; skipping {relative}");
-                unstable.insert(relative);
-                continue;
-            };
-            entries.insert(
-                relative.clone(),
-                Entry {
-                    path: relative,
-                    kind: EntryKind::File,
-                    content_hash: Some(observed.content_hash),
-                    symlink_target: None,
-                    size: observed.size,
-                    mode: observed.mode,
-                    version: placeholder_version(),
-                },
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn read_supported_symlink(path: &Path) -> io::Result<Option<String>> {
-    let target = fs::read_link(path)?;
-    let Some(target) = target.to_str().map(|s| s.to_string()) else {
-        return Ok(None);
-    };
-    if validate_symlink_target(&target).is_err() {
-        return Ok(None);
-    }
-    Ok(Some(target))
-}
-
-fn should_ignore(relative: &str, ignore_patterns: &[IgnorePattern]) -> bool {
-    if relative == IGNORE_FILE_NAME {
-        return false;
-    }
-
-    Path::new(relative).components().any(|component| {
-        let name = component.as_os_str().to_string_lossy();
-        should_ignore_component(&name)
-    }) || matches_ignore_patterns(ignore_patterns, relative)
-}
-
-fn should_ignore_component(name: &str) -> bool {
-    name == STATE_DIR
-        || IGNORED_FILE_NAMES.contains(&name)
-        || IGNORED_FILE_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-        || IGNORED_DIR_NAMES.contains(&name)
-}
-
-fn relative_path(root: &Path, path: &Path) -> io::Result<String> {
-    let relative = path
-        .strip_prefix(root)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    Ok(relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/"))
-}
-
-fn hash_file(path: &Path) -> io::Result<[u8; 32]> {
-    let mut file = fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(*hasher.finalize().as_bytes())
-}
-
-fn observe_file_when_stable(
-    path: &Path,
-    mut before: fs::Metadata,
-    wait_for_recent: bool,
-) -> io::Result<Option<ObservedFile>> {
-    for attempt in 0..FILE_STABILITY_ATTEMPTS {
-        if wait_for_recent && is_recently_modified(&before) {
-            std::thread::sleep(FILE_STABILITY_PAUSE);
-            let after_pause = fs::symlink_metadata(path)?;
-            if !after_pause.is_file() {
-                return Ok(None);
-            }
-            before = after_pause;
-            continue;
-        }
-
-        let content_hash = hash_file(path)?;
-        let after_hash = fs::symlink_metadata(path)?;
-        if !after_hash.is_file() {
-            return Ok(None);
-        }
-        if same_file_observation(&before, &after_hash) {
-            return Ok(Some(ObservedFile {
-                content_hash,
-                size: after_hash.len(),
-                mode: mode(&after_hash),
-            }));
-        }
-
-        before = after_hash;
-        if attempt + 1 < FILE_STABILITY_ATTEMPTS {
-            std::thread::sleep(FILE_STABILITY_PAUSE);
-        }
-    }
-    Ok(None)
-}
-
-fn same_file_observation(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-        && mode(left) == mode(right)
-}
-
-fn is_recently_modified(metadata: &fs::Metadata) -> bool {
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age < FILE_STABLE_AGE)
-        .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn mode(metadata: &fs::Metadata) -> Option<u32> {
-    use std::os::unix::fs::PermissionsExt;
-    Some(metadata.permissions().mode())
-}
-
-#[cfg(not(unix))]
-fn mode(_metadata: &fs::Metadata) -> Option<u32> {
-    None
-}
-
-#[derive(Clone, Debug)]
-struct IgnorePattern {
-    pattern: String,
-    negated: bool,
-    directory_only: bool,
-    anchored: bool,
-    has_slash: bool,
-}
-
-fn load_ignore_patterns(root: &Path) -> io::Result<Vec<IgnorePattern>> {
-    match fs::read_to_string(root.join(IGNORE_FILE_NAME)) {
-        Ok(contents) => Ok(parse_ignore_patterns(&contents)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(err) => Err(err),
-    }
-}
-
-fn parse_ignore_patterns(contents: &str) -> Vec<IgnorePattern> {
-    let mut patterns = Vec::new();
-    for raw_line in contents.lines() {
-        let mut line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let negated = line.starts_with('!');
-        if negated {
-            line = &line[1..];
-        }
-
-        let directory_only = line.ends_with('/');
-        if directory_only {
-            line = line.trim_end_matches('/');
-        }
-
-        let anchored = line.starts_with('/');
-        if anchored {
-            line = &line[1..];
-        }
-
-        if line.is_empty() {
-            continue;
-        }
-
-        patterns.push(IgnorePattern {
-            pattern: line.to_string(),
-            negated,
-            directory_only,
-            anchored,
-            has_slash: line.contains('/'),
-        });
-    }
-    patterns
-}
-
-fn matches_ignore_patterns(patterns: &[IgnorePattern], relative: &str) -> bool {
-    let mut ignored = false;
-    for pattern in patterns {
-        if matches_ignore_pattern(pattern, relative) {
-            ignored = !pattern.negated;
-        }
-    }
-    ignored
-}
-
-fn matches_ignore_pattern(pattern: &IgnorePattern, relative: &str) -> bool {
-    let targets = if pattern.directory_only {
-        directory_candidates(relative)
-    } else {
-        vec![relative.to_string()]
-    };
-
-    for target in targets {
-        if pattern.anchored {
-            if glob_match(&pattern.pattern, &target) {
-                return true;
-            }
-            continue;
-        }
-
-        if pattern.has_slash {
-            for suffix in path_suffix_candidates(&target) {
-                if glob_match(&pattern.pattern, suffix) {
-                    return true;
-                }
-            }
-        } else {
-            for component in target.split('/') {
-                if glob_match(&pattern.pattern, component) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn directory_candidates(relative: &str) -> Vec<String> {
-    let parts: Vec<&str> = relative.split('/').collect();
-    let mut out = Vec::with_capacity(parts.len());
-    for i in 0..parts.len() {
-        out.push(parts[..=i].join("/"));
-    }
-    out
-}
-
-fn path_suffix_candidates(relative: &str) -> Vec<&str> {
-    let mut suffixes = Vec::new();
-    let mut start = 0usize;
-    suffixes.push(relative);
-    while let Some(pos) = relative[start..].find('/') {
-        start += pos + 1;
-        suffixes.push(&relative[start..]);
-    }
-    suffixes
-}
-
-fn glob_match(pattern: &str, text: &str) -> bool {
-    glob_match_bytes(pattern.as_bytes(), text.as_bytes())
-}
-
-fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
-    if pattern.is_empty() {
-        return text.is_empty();
-    }
-    if pattern.starts_with(b"**") {
-        let rest = &pattern[2..];
-        if glob_match_bytes(rest, text) {
-            return true;
-        }
-        return !text.is_empty() && glob_match_bytes(pattern, &text[1..]);
-    }
-    match pattern[0] {
-        b'*' => {
-            let rest = &pattern[1..];
-            if glob_match_bytes(rest, text) {
-                return true;
-            }
-            !text.is_empty() && text[0] != b'/' && glob_match_bytes(pattern, &text[1..])
-        }
-        b'?' => !text.is_empty() && text[0] != b'/' && glob_match_bytes(&pattern[1..], &text[1..]),
-        ch => !text.is_empty() && ch == text[0] && glob_match_bytes(&pattern[1..], &text[1..]),
-    }
-}
-
-fn tombstone_entry(path: &str, old: &Entry, version: Version) -> Entry {
-    Entry {
-        path: path.to_string(),
-        kind: EntryKind::Tombstone,
-        content_hash: None,
-        symlink_target: None,
-        size: 0,
-        mode: old.mode,
-        version,
-    }
-}
-
-fn placeholder_version() -> Version {
-    Version {
-        lamport: 0,
-        origin: String::new(),
-    }
-}
-
-fn same_observed_state(left: &Entry, right: &Entry) -> bool {
-    left.path == right.path
-        && left.kind == right.kind
-        && left.content_hash == right.content_hash
-        && left.symlink_target == right.symlink_target
-        && left.size == right.size
-        && left.mode == right.mode
-}
-
-fn derive_tree(entries: &BTreeMap<String, Entry>) -> TreeSnapshot {
-    derive_tree_with(entries, |_| true)
-}
-
-fn derive_live_tree(entries: &BTreeMap<String, Entry>) -> TreeSnapshot {
-    derive_tree_with(entries, |entry| entry.kind != EntryKind::Tombstone)
-}
-
-fn update_tree_snapshot(
-    snapshot: &mut TreeSnapshot,
-    entries: &BTreeMap<String, Entry>,
-    changed_paths: &[String],
-    include: impl Fn(&Entry) -> bool,
-) {
-    // Collect dirty node paths: ancestors of every changed path, plus the
-    // changed paths themselves in case they are dir nodes.
-    let mut dirty: BTreeSet<String> = BTreeSet::new();
-    for path in changed_paths {
-        dirty.insert(path.clone());
-        dirty.extend(ancestors(path));
-    }
-
-    // When a dir node is removed, all its descendant nodes are also stale.
-    for path in changed_paths {
-        if !snapshot.nodes.contains_key(path) {
-            continue;
-        }
-        let still_included = entries.get(path).is_some_and(&include);
-        if still_included {
-            continue;
-        }
-        let prefix = format!("{path}/");
-        let descendants: Vec<String> = snapshot
-            .nodes
-            .keys()
-            .filter(|k| k.starts_with(&prefix))
-            .cloned()
-            .collect();
-        for desc in descendants {
-            dirty.extend(ancestors(&desc));
-            dirty.insert(desc);
-        }
-    }
-
-    // Index entries by their parent node path for O(1) lookup per node.
-    let mut by_parent: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
-    for entry in entries.values() {
-        if include(entry) {
-            by_parent
-                .entry(parent_path(&entry.path))
-                .or_default()
-                .push(entry);
-        }
-    }
-
-    // Process dirty nodes bottom-up (reverse lex = deepest first) so that
-    // when a parent reads its children hashes they are already up to date.
-    for node_path in dirty.iter().rev() {
-        let direct_entries: BTreeMap<String, [u8; 32]> = by_parent
-            .get(node_path)
-            .map(|es| {
-                es.iter()
-                    .map(|e| (basename(&e.path), hash_entry(e)))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let direct_children: BTreeMap<String, [u8; 32]> = snapshot
-            .nodes
-            .iter()
-            .filter(|(k, _)| !k.is_empty() && &parent_path(k) == node_path)
-            .map(|(k, v)| (basename(k), v.hash))
-            .collect();
-
-        if node_path.is_empty() || !direct_entries.is_empty() || !direct_children.is_empty() {
-            let prefix = display_prefix(node_path);
-            let hash = hash_node(&prefix, &direct_entries, &direct_children);
-            snapshot.nodes.insert(
-                node_path.clone(),
-                TreeNode {
-                    prefix,
-                    entries: direct_entries,
-                    children: direct_children,
-                    hash,
-                },
-            );
-        } else {
-            snapshot.nodes.remove(node_path);
-        }
-    }
-
-    snapshot.root_hash = snapshot.nodes.get("").map(|n| n.hash).unwrap_or([0; 32]);
-}
-
-fn derive_tree_with(
-    entries: &BTreeMap<String, Entry>,
-    include: impl Fn(&Entry) -> bool,
-) -> TreeSnapshot {
-    let mut node_paths = BTreeSet::new();
-    node_paths.insert(String::new());
-
-    for entry in entries.values() {
-        if !include(entry) {
-            continue;
-        }
-        for ancestor in ancestors(&entry.path) {
-            node_paths.insert(ancestor);
-        }
-        if entry.kind == EntryKind::Dir {
-            node_paths.insert(entry.path.clone());
-        }
-    }
-
-    let mut partials = BTreeMap::new();
-    for path in &node_paths {
-        partials.insert(
-            path.clone(),
-            TreeNode {
-                prefix: display_prefix(path),
-                entries: BTreeMap::new(),
-                children: BTreeMap::new(),
-                hash: [0; 32],
-            },
-        );
-    }
-
-    for entry in entries.values() {
-        if !include(entry) {
-            continue;
-        }
-        let parent = parent_path(&entry.path);
-        let name = basename(&entry.path);
-        if let Some(node) = partials.get_mut(&parent) {
-            node.entries.insert(name, hash_entry(entry));
-        }
-    }
-
-    let mut hashes = BTreeMap::new();
-    for path in node_paths.iter().rev() {
-        let child_paths: Vec<String> = node_paths
-            .iter()
-            .filter(|candidate| parent_path(candidate) == *path && !candidate.is_empty())
-            .cloned()
-            .collect();
-
-        let mut children = BTreeMap::new();
-        for child in child_paths {
-            if let Some(hash) = hashes.get(&child) {
-                children.insert(basename(&child), *hash);
-            }
-        }
-
-        let node = partials
-            .get_mut(path)
-            .expect("node path came from the same set");
-        node.children = children;
-        node.hash = hash_node(&node.prefix, &node.entries, &node.children);
-        hashes.insert(path.clone(), node.hash);
-    }
-
-    TreeSnapshot {
-        root_hash: hashes.get("").copied().unwrap_or([0; 32]),
-        nodes: partials,
-    }
-}
-
-fn ancestors(path: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut current = parent_path(path);
-    loop {
-        out.push(current.clone());
-        if current.is_empty() {
-            break;
-        }
-        current = parent_path(&current);
-    }
-    out
-}
-
-fn normalize_prefix(prefix: &str) -> String {
-    prefix.trim_matches('/').to_string()
-}
-
-fn parent_path(path: &str) -> String {
-    path.rsplit_once('/')
-        .map(|(parent, _)| parent.to_string())
-        .unwrap_or_default()
-}
-
-fn basename(path: &str) -> String {
-    path.rsplit_once('/')
-        .map(|(_, name)| name.to_string())
-        .unwrap_or_else(|| path.to_string())
-}
-
-fn display_prefix(path: &str) -> String {
-    if path.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{path}/")
-    }
-}
-
-fn hash_entry(entry: &Entry) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    encode_str(&mut hasher, "lil-entry-v1");
-    encode_str(&mut hasher, &entry.path);
-    encode_str(&mut hasher, entry.kind.as_str());
-    encode_opt_hash(&mut hasher, entry.content_hash);
-    encode_opt_str(&mut hasher, entry.symlink_target.as_deref());
-    hasher.update(&entry.size.to_be_bytes());
-    encode_opt_u32(&mut hasher, entry.mode);
-    hasher.update(&entry.version.lamport.to_be_bytes());
-    encode_str(&mut hasher, &entry.version.origin);
-    *hasher.finalize().as_bytes()
-}
-
-fn hash_node(
-    prefix: &str,
-    entries: &BTreeMap<String, [u8; 32]>,
-    children: &BTreeMap<String, [u8; 32]>,
-) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lil-node-v1");
-    encode_str(&mut hasher, prefix);
-    for (name, hash) in entries {
-        encode_str(&mut hasher, "entry");
-        encode_str(&mut hasher, name);
-        hasher.update(hash);
-    }
-    for (name, hash) in children {
-        encode_str(&mut hasher, "child");
-        encode_str(&mut hasher, name);
-        hasher.update(hash);
-    }
-    *hasher.finalize().as_bytes()
-}
-
-fn encode_str(hasher: &mut blake3::Hasher, value: &str) {
-    let bytes = value.as_bytes();
-    hasher.update(&(bytes.len() as u64).to_be_bytes());
-    hasher.update(bytes);
-}
-
-fn encode_opt_hash(hasher: &mut blake3::Hasher, value: Option<[u8; 32]>) {
-    match value {
-        Some(value) => {
-            hasher.update(&[1]);
-            hasher.update(&value);
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    };
-}
-
-fn encode_opt_str(hasher: &mut blake3::Hasher, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            hasher.update(&[1]);
-            encode_str(hasher, value);
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    };
-}
-
-fn encode_opt_u32(hasher: &mut blake3::Hasher, value: Option<u32>) {
-    match value {
-        Some(value) => {
-            hasher.update(&[1]);
-            hasher.update(&value.to_be_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    };
-}
-
-pub fn hex(hash: [u8; 32]) -> String {
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-pub fn entry_hash(entry: &Entry) -> [u8; 32] {
-    hash_entry(entry)
-}
-
-pub fn tree_node_hash(node: &TreeNode) -> [u8; 32] {
-    hash_node(&node.prefix, &node.entries, &node.children)
 }
 
 #[cfg(test)]
@@ -1866,8 +1030,6 @@ mod tests {
         fs::write(tmp.path().join(".nolil"), "keep.txt\n").unwrap();
         let changes = state.rescan().unwrap();
 
-        // .nolil changed but keep.txt should remain live — ignore stops local
-        // tracking without broadcasting a deletion to peers.
         assert!(changes.iter().any(|c| c.path == ".nolil"));
         let entry = state.entries.get("keep.txt").unwrap();
         assert_eq!(entry.kind, EntryKind::File);
@@ -2196,7 +1358,6 @@ mod tests {
         let changes = state.apply_paths(vec![nolil]).unwrap();
 
         assert!(changes.iter().any(|c| c.path == ".nolil"));
-        // keep.txt is now ignored but stays live in state — no deletion broadcast
         assert_eq!(state.entries.get("keep.txt").unwrap().kind, EntryKind::File);
     }
 
@@ -2209,8 +1370,6 @@ mod tests {
 
         let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
 
-        // Modify via apply_paths, then confirm rescan sees no further changes
-        // (meaning incremental state is identical to a fresh scan).
         fs::write(tmp.path().join("sub/a.txt"), "modified").unwrap();
         state
             .apply_paths(vec![tmp.path().join("sub/a.txt")])
@@ -2226,7 +1385,6 @@ mod tests {
         assert_eq!(state.root_hash(), incremental_root);
         assert_eq!(state.live_root_hash(), incremental_live);
 
-        // Delete a file, then verify the same way.
         fs::remove_file(tmp.path().join("b.txt")).unwrap();
         state.apply_paths(vec![tmp.path().join("b.txt")]).unwrap();
         let after_delete_root = state.root_hash();
@@ -2249,16 +1407,13 @@ mod tests {
         let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
         assert_eq!(state.entry("a.txt").unwrap().kind, EntryKind::File);
 
-        // Delete the file and persist state.
         fs::remove_file(tmp.path().join("a.txt")).unwrap();
         state.apply_paths(vec![tmp.path().join("a.txt")]).unwrap();
         assert_eq!(state.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
 
-        // Restart: tombstone must survive.
         let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
         assert_eq!(state.entry("a.txt").unwrap().kind, EntryKind::Tombstone);
 
-        // GC after root convergence records a watermark and removes the tombstone.
         assert_eq!(state.gc_tombstones_for_converged_root(), 1);
         assert!(state.entry("a.txt").is_none());
     }
